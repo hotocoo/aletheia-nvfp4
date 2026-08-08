@@ -1126,7 +1126,19 @@ class Attention(nn.Module):
         # The attention math itself stays BF16: arXiv:2509.25149 keeps attention out of FP4.
         kw = {"enable_gqa": True} if self.nkv != self.nh else {}
         if cache is not None:
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=False, **kw)
+            if L > 1:                      # prefill: build the mask explicitly. is_causal cannot be
+                                           # used because the sink column shifts the diagonal.
+                S = k.shape[2]
+                qi = torch.arange(S - L, S, device=x.device)[:, None]
+                ki = torch.arange(S, device=x.device)[None, :]
+                cm = ki <= qi
+                if self.window:
+                    cm &= (qi - ki) < self.window
+                if self.sink_k is not None:
+                    cm[:, 0] = True
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=cm[None, None], **kw)
+            else:
+                out = F.scaled_dot_product_attention(q, k, v, is_causal=False, **kw)
         else:
             mask = masks[1 if self.is_global else 0]
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, **kw)
@@ -1502,6 +1514,13 @@ class MasterWeights:
         for p, m in self.pairs:
             p.data.copy_(m.data.to(p.dtype))
 
+    def resync(self):
+        # After loading a checkpoint the model holds the restored weights and the masters still
+        # hold whatever they were cloned from. Without this, the first to_model() after a resume
+        # overwrites the checkpoint with the init values.
+        for p, m in self.pairs:
+            m.data.copy_(p.data.float())
+
     @property
     def master_params(self):
         return [m for _, m in self.pairs]
@@ -1622,6 +1641,8 @@ class CheckpointManager:
 
 ckpt = CheckpointManager(CKPT)
 start_step, telemetry = ckpt.load()
+for _m in MASTERS:            # masters were cloned before the checkpoint was restored
+    _m.resync()
 
 
 @torch.no_grad()
@@ -1653,6 +1674,7 @@ def train(total_steps: int = TOTAL_STEPS, start: int = None):
             print(f"\n[precision] step {step}: {cfg.precision.upper()} -> BF16 for the tail")
         scale = set_lr(step)
         cur_lr = opt_muon.param_groups[0]["lr"]
+        model.zero_grad(set_to_none=True)      # grads live on the model, not on the masters
         for o in OPTS:
             o.zero_grad(set_to_none=True)
         loss_acc = 0.0
@@ -2080,6 +2102,7 @@ def anneal(steps: int = 500, lr_frac: float = 0.1):
     model.train()
     bar = tqdm(total=steps, desc="anneal (BF16, masked)", dynamic_ncols=True)
     for step in range(steps):
+        model.zero_grad(set_to_none=True)
         for o in OPTS:
             o.zero_grad(set_to_none=True)
         acc = 0.0
@@ -2089,8 +2112,13 @@ def anneal(steps: int = 500, lr_frac: float = 0.1):
                 l = model(x.to(DEV), y.to(DEV), loss_mask=m.to(DEV)) / cfg.grad_accum
             l.backward(); acc += l.item()
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        for mw in MASTERS:
+            mw.to_master()
         for o in OPTS:
             o.step()
+        for mw in MASTERS:
+            mw.to_model()
+        ema.update(model)
         bar.set_postfix(loss=f"{acc:.4f}"); bar.update(1)
     bar.close()
     ckpt.save(TOTAL_STEPS + steps, telemetry)
