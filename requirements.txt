@@ -1,0 +1,22 @@
+# Latest releases as of 2026-08-08. Install torch and transformer_engine first (see README):
+#   pip install --upgrade "torch>=2.13.0" --index-url https://download.pytorch.org/whl/cu130
+#   pip install --no-build-isolation "transformer_engine[pytorch]>=2.17.1"   # Linux / WSL2 only
+#
+# The notebook also runs on older stacks: it falls back from `autocast` to the deprecated
+# `fp8_autocast`, and to a bundled Newton-Schulz Muon when torch.optim.Muon is absent
+# (verified end-to-end on torch 2.7.1 / transformers 4.55 / tokenizers 0.21).
+tokenizers>=0.23.1
+transformers>=5.14.1
+datasets>=5.0.1
+safetensors>=0.6
+numpy>=2.1
+matplotlib>=3.10
+tqdm>=4.67
+zstandard>=0.24
+ipywidgets>=8.1
+
+# Optional
+# flash-linear-attention   # cfg.hybrid_linear=True (gated DeltaNet layers)
+# lm-eval                  # public benchmark suite
+# tiktoken                 # tokenizer comparison baselines
+# sentencepiece            # compare against the old aletheiacode64k model

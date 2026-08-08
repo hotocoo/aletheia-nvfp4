@@ -1,0 +1,8 @@
+aletheia_nvfp4/
+__pycache__/
+*.pyc
+*.bin
+*.idx
+*.safetensors
+.ipynb_checkpoints/
+.venv/
