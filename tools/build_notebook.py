@@ -1939,6 +1939,9 @@ def export_hf():
     HF_EXPORT.mkdir(parents=True, exist_ok=True)
     from safetensors.torch import save_file
     sd = {k: v.detach().to(torch.bfloat16).contiguous().cpu() for k, v in model.state_dict().items()}
+    if cfg.tie_embeddings:
+        sd.pop("lm_head.weight", None)      # shares storage with embed.weight; safetensors refuses
+                                            # aliases, and `tie_word_embeddings` restores it on load
     save_file(sd, str(HF_EXPORT / "model.safetensors"), metadata={"format": "pt"})
     (HF_EXPORT / "config.json").write_text(json.dumps({
         "model_type": "aletheia_chat", "architectures": ["AletheiaChatForCausalLM"],
