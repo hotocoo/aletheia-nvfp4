@@ -1,46 +1,49 @@
 # Aletheia-NVFP4
 
-4-bit (NVFP4) pretraining of **Aletheia-Chat** — a conversational model whose domain knowledge is
-[Aletheia OS](https://github.com/hotocoo/aletheia): its microkernel, capability engine, policy engine,
-Context Fabric, WASM component runtime and ADRs.
+A **new** chat model, pretrained from scratch in **NVFP4** (4-bit) on one consumer Blackwell GPU.
+Nothing is inherited: its own tokenizer, its own architecture, random init, no distillation, no
+weights from any other model. Its domain knowledge is
+[Aletheia OS](https://github.com/hotocoo/aletheia) — kernel, capability engine, policy engine,
+Context Fabric, WASM component runtime, ADRs.
 
-Successor to [`aletheia1Bmx`](https://github.com/hotocoo/aletheia1Bmx) (MLX / bfloat16 / Apple
-Silicon) and to [`aletheiatokenizer`](https://github.com/hotocoo/aletheiatokenizer) (64k
-code-only SentencePiece unigram).
+Not to be confused with `aletheia-lm`, which is a **code** model. This one talks.
 
 | | |
 |---|---|
-| **Notebook** | [`Aletheia_NVFP4_Pretrain.ipynb`](Aletheia_NVFP4_Pretrain.ipynb) — 39 cells, end to end |
-| **Research** | [`RESEARCH.md`](RESEARCH.md) — every decision, its August-2026 source, and the disagreements between sources |
+| **Notebook** | [`Aletheia_NVFP4_Pretrain.ipynb`](Aletheia_NVFP4_Pretrain.ipynb) — tokenizer → data → model → 4-bit training → benchmarks → chat anneal → eval → chat |
+| **Research** | [`RESEARCH.md`](RESEARCH.md) — every decision, its August-2026 source, and where sources disagree |
 | **Generator** | [`tools/build_notebook.py`](tools/build_notebook.py) — the notebook is generated from this, so it stays diffable |
 
-## What it does, in order
+## The stack (all August 2026, all on by default)
 
-1. **Capability probe** — picks NVFP4 → MXFP8 → FP8 → BF16 based on what the GPU and Transformer
-   Engine actually support, and says which path it took.
-2. **Tokenizer** — trains a **SuperBPE-style superword tokenizer** (`vocab=65536`, byte-level, no
-   UNK) on Aletheia OS + prose + code, with chat and OS-pipeline special tokens; benchmarks
-   bytes/token against plain BPE, the old `aletheiacode64k`, and `cl100k`/`o200k`.
-3. **Data** — streams Nemotron-CC-v2 / FineWeb-Edu / DCLM / the-stack-v2 / open-web-math / SmolTalk2
-   into `uint16` memmap shards with a document index, and upsamples the Aletheia repo ~24×.
-4. **Model** — dense decoder, GQA + QK-norm, pre+post RMSNorm, SwiGLU, sliding-window : global = 3:1,
-   split RoPE bases (10k local / 1M global), tied embeddings, FP32 logits + z-loss. Optional gated
-   DeltaNet hybrid.
-5. **Training** — `NVFP4BlockScaling` (16×16 RHT on Wgrad, stochastic rounding on gradients, 2D weight
-   scaling), first 2 + last 4 blocks in BF16, **NVFP4 → BF16 for the last 18% of tokens**, Muon on 2D
-   matrices + AdamW elsewhere, WSD schedule, grad accumulation, activation checkpointing,
-   `torch.compile`, resumable checkpoints.
-6. **Benchmarks** — recipe A/B for relative loss gap, tokens/s, MFU and peak memory; KV-cache and
-   decode latency; an ablation grid over every contested knob.
-7. **Anneal** — masked chat mid-training on SmolTalk2 + mechanically generated Aletheia QA + templated
-   `intent → context → plan → capability → policy → action → provenance` traces.
-8. **Evaluation** — lm-eval-harness v2 hard suite and easy suite invocations, per-domain perplexity,
-   and a closed-book **Aletheia knowledge probe** over ten facts from the repository.
-9. **Chat** — KV-cached generation behind the chat template.
+**Number format — NVFP4.** E2M1 values, FP8-E4M3 scale per 16, FP32 global scale. 16×16 random
+Hadamard transform on Wgrad inputs, stochastic rounding on gradients only, 2D 16×16 weight scaling,
+first 2 + last 4 blocks kept BF16, and a switch to BF16 for the final 18% of tokens. That is
+arXiv:2509.25149's recipe, which held a 12B model to <1.5% relative loss versus FP8 over 10T tokens.
+
+**Tokenizer — custom, built by the notebook.** A true two-stage **SuperBPE** superword tokenizer:
+byte-level (no UNK), `vocab=32768`, stage 1 under a whitespace-crossing (`xw`) split regex, stage 2
+with the barrier lifted so tokens may span spaces. The 32k-class vocabulary and the `xw` regex are
+not guesses — they are the winning arm of a five-way sweep measured locally
+([RESEARCH.md §1](RESEARCH.md#1-starting-point)), where `32k xw` beat `64k v2` outright. Stage 2 is
+learned over the stage-1 id stream with an incremental linked-list + lazy-heap trainer, which is what
+makes a faithful SuperBPE run possible without forking the Rust `BpeTrainer`.
+
+**Architecture — every compatible SOTA component:**
+
+- hybrid attention 3:1 — gated DeltaNet (or sliding-window 1024) : full attention
+- GQA 4:1, QK-norm, learnable **attention sinks**, Gemma 4 **pp-RoPE** (25% rotation, θ 10k/1M split)
+- pre+post RMSNorm, SwiGLU, no biases, tied embeddings, depth-scaled init
+- **MoE** FFN — top-2 of 8 + 1 shared expert, aux-loss-free bias balancing (off on 12 GB, on above)
+- **multi-token prediction** head (also gives speculative decoding for free)
+- **intra-document masking** inside packed sequences, z-loss, FP32 logits
+- **Muon** (2D matrices) + AdamW, **FP32 master weights**, warmup-hold-decay
+
+Declined on purpose, with reasons, in [RESEARCH.md §5](RESEARCH.md#5-architecture).
 
 ## Requirements
 
-Linux or **WSL2** (Transformer Engine ships Linux wheels only), CUDA 12.8+/13.x, an NVIDIA GPU with
+Linux or **WSL2** (Transformer Engine ships Linux wheels only), CUDA 13.x, an NVIDIA GPU with
 compute capability ≥ 10.0 for the FP4 path — B200/B300 (`sm_100`), RTX 5070/5080/5090 or
 RTX PRO 6000 (`sm_120`). Without one, everything still runs in BF16.
 
@@ -58,32 +61,56 @@ CUDA 13.0 is the PyPI default; CUDA 13.2 (`.../whl/nightly/cu132`) carries the w
 support. For source builds on RTX 50-series, include `12.0 12.1` in `TORCH_CUDA_ARCH_LIST`.
 
 Older stacks work too — the notebook falls back from TE's `autocast` to the deprecated
-`fp8_autocast`, and to a bundled Newton–Schulz Muon when `torch.optim.Muon` is absent. It was smoke
-tested end-to-end (tokenizer → shards → model → train → anneal → probe) on torch 2.7.1 CPU /
-transformers 4.55 / tokenizers 0.21.
+`fp8_autocast`, and to a bundled Newton–Schulz Muon when `torch.optim.Muon` is absent.
+
+## How to pretrain it
+
+```bash
+wsl                                   # Transformer Engine needs Linux
+jupyter lab Aletheia_NVFP4_Pretrain.ipynb
+```
+
+Then run the cells in order. What each stage costs on an RTX 5070:
+
+| # | cell | what happens | time |
+|---|---|---|---|
+| 1 | probe | prints your precision path (NVFP4 / MXFP8 / FP8 / BF16) | seconds |
+| 2 | config | `PRESET = "rtx5070"`; prints params, steps, and an honest budget reality check | seconds |
+| 3 | tokenizer | clones Aletheia OS, streams ~1.5 GB of chat/prose/code, trains both SuperBPE stages, benchmarks bytes/token | ~1–2 h |
+| 4 | data | streams the mixture into `uint16` shards, Aletheia upsampled 24× | hours, resumable |
+| 5–7 | model / recipe / optimizer | builds the model, picks the recipe, splits Muon vs AdamW | seconds |
+| 8 | **train** | the run. Checkpoints every 200 steps, resumes from `ckpt/manifest.json` | `train_days` (default 14) |
+| 9 | benchmarks | NVFP4-vs-BF16 loss gap, tok/s, MFU, peak memory, KV cache, ablations | ~20 min |
+| 10 | anneal | masked chat mid-training: SmolTalk2 + synthetic Aletheia QA + pipeline traces | ~1 h |
+| 11 | eval | lm-eval invocations, per-domain perplexity, Aletheia knowledge probe | ~20 min |
+| 12 | chat | talk to it | — |
+
+Interrupting is safe at any point — the training cell resumes from the last checkpoint. To make the
+run shorter or longer, change `train_days`; to change the model's shape, change `PRESET`.
 
 ## Scale
 
-`PRESET` in the config cell selects one of three coherent shapes. Nothing else needs changing.
+| preset | shape | target |
+|---|---|---|
+| `rtx5070` (default) | 1024 × 24, seq 2048, mb 2 × accum 8, dense | 12 GB consumer Blackwell |
+| `workstation` | 1536 × 28, MoE 8×top-2, mb 8 × accum 4 | RTX PRO 6000 / H200 |
+| `cluster` | 2048 × 32, MoE 32×top-2, seq 4096 | multi-node B200 |
 
-| preset | shape | token budget | target |
-|---|---|---|---|
-| `laptop` | 1024 × 16, seq 1024 | 400 tok/param | 12 GB RTX 5070 smoke run |
-| `workstation` | 2048 × 30, seq 2048, mb 4×16 | 13,000 tok/param | RTX PRO 6000 / H200 |
-| `cluster` | 2048 × 30, seq 4096, mb 8×24 | 13,000 tok/param | multi-node B200 |
-
-**Chinchilla is deliberately ignored.** The budget is ~13,000 tokens per non-embedding parameter — the
-LFM2.5-2.6B ratio (~34T tokens / 2.69B params), roughly 650× compute-optimal. Reasoning and sources in
-[`RESEARCH.md §7`](RESEARCH.md#7-token-budget).
+**Chinchilla is deliberately ignored** — but so is arithmetic that doesn't hold. 13,000
+tokens/parameter (the LFM2.5-2.6B ratio, ~34T tokens on 2.69B params) would need ~3.5T tokens for
+this model, which is GPU-years on a 5070. The config cell prints exactly that comparison and then
+sizes the run by wall clock instead of by wishful ratio. On a `cluster` preset the ratio is reachable;
+on this machine it is not, and the notebook says so rather than quietly training for a week and
+calling it SOTA.
 
 ## Honest limitations
 
-- NVFP4 *training* on consumer `sm_120` is inferred from TE's `cc >= 10.0` gate and third-party
-  RTX 5090 measurements, not from a vendor guarantee. Run the recipe A/B before spending a budget.
-- Measured FP4 end-to-end speedup is ~9–20% over FP8, not the 2–3× arithmetic ratio: non-GEMM work
-  does not shrink.
-- A 12 GB GPU cannot reach 13k tok/param in human time. The `laptop` preset is a correctness test.
-- No distillation. It is the strongest quality lever at this scale and is out of scope here.
+- NVFP4 *training* on consumer `sm_120` is inferred from TE's `cc >= 10.0` gate plus third-party
+  RTX 5090 measurements, not a vendor guarantee. Run the §9 recipe A/B before spending a budget.
+- Measured FP4 end-to-end speedup is ~9–20% over FP8, not the 2–3× arithmetic ratio.
+- Verified end to end only at toy scale in BF16 on CPU (all 23 code cells). The FP4 path has not been
+  executed on this machine — it has no Transformer Engine and no Linux.
+- No distillation. Strongest quality lever at this scale, out of scope for a from-scratch pretrain.
 
 Full risk list: [`RESEARCH.md §10`](RESEARCH.md#10-open-risks).
 

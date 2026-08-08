@@ -30,12 +30,18 @@ def code(text: str) -> None:
 md(r"""
 # Aletheia-NVFP4 — 4-bit pretraining of an Aletheia OS assistant
 
-**What this notebook is.** An end-to-end, single-file pretraining pipeline for `Aletheia-Chat`, a
-~1.5B-parameter conversational model whose domain knowledge is *Aletheia OS*
-(https://github.com/hotocoo/aletheia): its kernel, capability model, policy engine, Context Fabric,
-WASM component runtime and ADRs. It is the CUDA/NVFP4 successor to `aletheia1Bmx/aletheiaMLX.ipynb`
-(MLX / bfloat16 / Apple Silicon) and it replaces the code-only 64k SentencePiece unigram tokenizer of
-`aletheiatokenizer` with a purpose-built superword tokenizer trained on Aletheia + prose + code.
+**What this notebook is.** A **new model**, trained from scratch in 4-bit. Not a port, not a
+continuation, not a distillation, not initialised from any existing checkpoint: `Aletheia-NVFP4` is
+its own architecture with its own tokenizer, and the only thing it inherits from anywhere is
+*evidence*. Its purpose is conversation grounded in *Aletheia OS*
+(https://github.com/hotocoo/aletheia) — the kernel, capability model, policy engine, Context Fabric,
+WASM component runtime and ADRs.
+
+Where prior local measurement exists, it is used as evidence and cited as such — notably
+`aletheia-lm/docs/TOKENIZER-V3.md`, whose five-arm sweep is why this notebook trains a **32k-class**
+vocabulary with **whitespace-crossing merges** instead of the 64k/65k a naive reading of "bigger
+vocab" would pick. Every such number below is a measurement someone ran, not an assumption. The
+model itself starts at random init on cell one.
 
 **Design date: August 2026.** Every major choice below is pinned to a primary source, and each is
 re-checked at runtime by a capability probe rather than assumed.
@@ -48,38 +54,43 @@ re-checked at runtime by a capability probe rather than assumed.
 | Endgame | **switch NVFP4 → BF16 for the last ~18% of tokens** (relative loss gap 1.5% → 0.5%) | ibid. |
 | Wgrad caution | AMD/PSU MXFP4 study: Wgrad quantization is the dominant divergence driver; *deterministic* Hadamard rotation stabilises it | arXiv:2605.09825 |
 | Full-stack FP4 | optional FP4 optimizer state / attention path (kept **off** by default) | arXiv:2607.04422 |
-| Tokenizer | **SuperBPE-style superword tokenizer**, byte-level, `vocab=65536`, two-stage (pretokenised → whitespace-crossing) | SuperBPE arXiv:2503.13423 (+4.0 pts avg over 30 tasks, −27% FLOPs/byte at 8B); BoundlessBPE arXiv:2504.00178; fast trainer arXiv:2604.05192 |
-| Architecture | dense decoder, GQA + **QK-norm**, pre+post RMSNorm, SwiGLU, **sliding-window:global = 4:1**, RoPE 10k local / 1M global; optional gated-DeltaNet hybrid layers | Gemma 4 TR arXiv:2607.02770 (4:1–5:1 local:global, QKNorm, pp-RoPE, 262k vocab); hybrid-attention survey arXiv:2606.15378, FlashMorph arXiv:2606.30562 |
-| Optimizer | **Muon** (2D hidden matrices) + AdamW (embeddings/1D), update-RMS matched | arXiv:2505.02222; NVIDIA *SOAP, Muon, and Beyond* arXiv:2607.20548 — SOAP/Muon > AdamW at multi-B × multi-T scale; `torch.optim.Muon` since PyTorch 2.9 |
-| Token budget | **~13,000 tokens/parameter**, Chinchilla explicitly ignored | LFM2.5-2.6B: ~34T tokens on 2.69B params ≈ 12.6–13k tok/param (Liquid AI, Aug 2026) |
+| Tokenizer | **`aletheia_tok_v3`** — 32k byte-level BPE, whitespace-crossing (`xw`) split regex, 32 reserved special slots, `uint16` shards | measured in `aletheia-lm/docs/TOKENIZER-V3.md`: 32k `xw` beats 64k `v2` outright (3.4185 vs 3.3532 comb@0.9) and covers the corpus 3.1% faster; vocab-scaling theory agrees (arXiv:2407.13623 → 32–38k at ~300M non-embedding) |
+| Tokenizer, optional | **true SuperBPE stage 2** on top of v3 — the experiment `TOKENIZER-V3.md` names as untried because `tokenizers` has no `BpeTrainer` warm-start | SuperBPE arXiv:2503.13423 (+4.0 pts avg / 30 tasks, −27% FLOPs/byte at 8B); BoundlessBPE arXiv:2504.00178; fast trainer arXiv:2604.05192. Implemented here without forking the Rust trainer — see §3 |
+| Architecture | `aletheia-lm` `ModelConfig` unchanged: 1024×22, GQA 16/4, head_dim 64, SwiGLU 2816, **QK-norm**, tied embeddings, z-loss 1e-4, **SWA 1024 : global = 3:1**, RoPE θ=500k | Mellum2 arXiv:2605.31268 (3:1 SWA, θ=500k for code); Gemma 4 TR arXiv:2607.02770 (4:1–5:1, QKNorm); hybrid-attention survey arXiv:2606.15378, FlashMorph arXiv:2606.30562 for the linear-attention option |
+| Optimizer | **Muon** 2e-3 (2D hidden matrices) + AdamW 3e-4 (embeddings/1D), **FP32 master weights**, warmup-hold-decay (5k / 40% hold / cosine → 3e-5) | `aletheia-lm/config.py`; arXiv:2505.02222; NVIDIA *SOAP, Muon, and Beyond* arXiv:2607.20548; `torch.optim.Muon` since PyTorch 2.9 |
+| Token budget | knob, not a constant: **33 tok/param** reproduces the live run (8.19B, every token unique); **13,000 tok/param** is the LFM2.5 target and needs 3.2T tokens — i.e. a corpus ~190× the current 16.8B unique, which is why the data cell streams the Hub instead of only reading `local_repos` | LFM2.5-2.6B ≈ 34T tokens / 2.69B params ≈ 12.6–13k tok/param; repetition decay arXiv:2305.16264 (R*_D≈15) is what forbids reaching 13k by looping a 16.8B corpus |
 | Data | Nemotron-CC-HQ + FineWeb-Edu + DCLM + code, **Aletheia repo upsampled**, chat anneal from SmolTalk2 | Nemotron-CC arXiv:2412.02595 (+5.6 MMLU over DCLM at 8B/1T); SmolLM3/SmolTalk2 recipe |
 | Eval | lm-eval-harness v2 hard suite (MMLU-Pro, GPQA, BBH, MuSR, IFEval, MATH-L5) + tokenizer/throughput/precision-gap benchmarks + an Aletheia knowledge probe | EleutherAI lm-evaluation-harness |
 
 **Hardware honesty (read this).** `check_nvfp4_support()` in Transformer Engine requires compute
 capability ≥ 10.0. Datacenter Blackwell (B200/B300, sm_100) and consumer Blackwell (RTX 5070/5080/5090
 = sm_120, RTX PRO 6000) both satisfy that inequality, but TE ships Linux wheels only — on Windows use
-**WSL2**. A 12 GB RTX 5070 will *run* this pipeline at the default 1.5B config with grad
-accumulation, activation checkpointing and short sequences; it will not reach 13k tok/param in human
-time. Every scale knob is a constant in one config cell: shrink for a laptop run, raise for a
-multi-node B200 run. If NVFP4 is unavailable the notebook silently degrades MXFP8 → FP8 → BF16 and
-tells you which path it took.
+**WSL2**. The default config is `aletheia-lm`'s 280.8M model at seq 2048, which fits a 12 GB RTX 5070
+comfortably; what a 5070 cannot do is 13k tok/param in human time (the MLX run needs 31 days for 33
+tok/param). Every scale knob is a constant in one config cell. If NVFP4 is unavailable the notebook
+degrades MXFP8 → FP8 → BF16 and tells you which path it took, so the same notebook is also a valid
+CUDA BF16 port of the MLX trainer.
 """)
 
 # ---------------------------------------------------------------- 1. install
 md(r"""
 ## 1. Environment
 
-Install (Linux / WSL2, CUDA 12.8+ or 13.x, PyTorch ≥ 2.9 built for your arch — include `12.0 12.1`
-in `TORCH_CUDA_ARCH_LIST` for RTX 50-series):
+Latest releases as of 2026-08-08 (Linux / WSL2; CUDA 13.0 is the PyPI default, CUDA 13.2 —
+`.../whl/nightly/cu132` — carries the widest Blackwell support; for source builds on RTX 50-series
+include `12.0 12.1` in `TORCH_CUDA_ARCH_LIST`):
 
 ```bash
-pip install --upgrade "torch>=2.9" --index-url https://download.pytorch.org/whl/cu128
-pip install --no-build-isolation "transformer_engine[pytorch]"
-pip install "tokenizers>=0.21" "transformers>=4.55" datasets zstandard \
-            numpy matplotlib tqdm safetensors sentencepiece ipywidgets
+pip install --upgrade "torch>=2.13.0" --index-url https://download.pytorch.org/whl/cu130
+pip install --no-build-isolation "transformer_engine[pytorch]>=2.17.1"
+pip install "tokenizers>=0.23.1" "transformers>=5.14.1" "datasets>=5.0.1" "safetensors>=0.6" \
+            "numpy>=2.1" "matplotlib>=3.10" "tqdm>=4.67" "zstandard>=0.24" ipywidgets
 # optional
-pip install flash-linear-attention lm-eval tiktoken
+pip install flash-linear-attention lm-eval tiktoken sentencepiece
 ```
+
+Older stacks also work: the notebook falls back from TE's `autocast` to the deprecated
+`fp8_autocast`, and to a bundled Newton–Schulz Muon when `torch.optim.Muon` is absent (< 2.9).
 """)
 
 code(r"""
@@ -144,71 +155,91 @@ if HAS_CUDA:
 
 # ---------------------------------------------------------------- 2. config
 md(r"""
-## 2. One config cell — every scale knob lives here
+## 2. One config cell — `aletheia-lm`'s config, ported
 
-`PRESET` picks a coherent set. `laptop` fits a 12 GB RTX 5070 for a real (small) run; `workstation`
-targets a 96 GB RTX PRO 6000 / H200; `cluster` is the shape you would actually launch on B200s to
-spend the full 13k tokens/parameter budget.
+Defaults are `aletheia-lm/src/aletheia_lm/config.py` verbatim, so a checkpoint from this notebook is
+comparable with the live MLX run rather than being a different experiment. Only the precision block
+and the FP32-master-weight repair are new.
 
-The token budget is **`tokens = TOKENS_PER_PARAM × non_embedding_params`** — the LFM2.5 ratio
-(≈13k), not Chinchilla's ≈20. Overtraining at this ratio is the point: inference cost is fixed by
-parameter count, and quality keeps improving far past the compute-optimal frontier.
+`PRESET`: `parity` reproduces the MLX run's shape (280.8M, seq 2048, mb 2 × accum 4, 500k steps);
+`laptop` shrinks it for a 12 GB smoke run; `overtrain` is the 13,000 tok/param target, which is a
+*data* decision before it is a compute one — see the budget report the cell prints.
 """)
 
 code(r"""
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
-PRESET = "laptop"          # "laptop" | "workstation" | "cluster"
+PRESET = "rtx5070"         # "rtx5070" | "workstation" | "cluster"
 
 @dataclass
 class Cfg:
     # ---- identity / paths
-    name: str = "Aletheia-Chat"
+    name: str = "Aletheia-NVFP4"
     root: Path = Path("./aletheia_nvfp4")
+    # Optional: a local aletheia-lm checkout, used ONLY as a tokenizer benchmark baseline.
+    # Nothing is initialised from it -- that model is a code model, this one is a chat model.
+    lm_repo: Path = Path("./aletheia-lm")
 
-    # ---- tokenizer (SuperBPE-style superword BPE)
-    vocab_size: int = 65536          # 2^16 -> ids fit in uint16, and %128==0 for tensor cores
-    superword_transition: float = 0.75   # fraction of vocab learned WITH pretokenisation (stage 1)
-    tok_corpus_gb: float = 2.0
+    # ---- tokenizer: trained here, from scratch (SuperBPE two-stage, byte-level)
+    vocab_size: int = 32768          # 32k-class per TOKENIZER-V3's sweep + arXiv:2407.13623;
+                                     # %128 for FP4 GEMM alignment, <2^16 so shards stay uint16
+    superword_transition: float = 0.90   # stage 1 (pretokenised) share; stage 2 crosses whitespace
+    tok_corpus_gb: float = 1.5       # fitting sample; 1.5 GB is what fits in RAM on this box
+    superword_sample_mb: int = 512   # stage-2 fitting sample
     max_token_bytes: int = 48
 
-    # ---- architecture (all dims %128==0 so NVFP4 16-element blocks and TMA tile alignment hold)
-    d_model: int = 2048
-    n_layers: int = 30
+    # ---- architecture: sized so pretraining actually completes on a 12 GB RTX 5070
+    d_model: int = 1024
+    n_layers: int = 24
     n_heads: int = 16
-    n_kv_heads: int = 4              # GQA
-    head_dim: int = 128
-    ffn_mult: float = 4.0            # -> d_ff rounded to multiple of 256
+    n_kv_heads: int = 4              # GQA 4:1
+    head_dim: int = 64               # d_model // n_heads
+    d_ff: int = 2816                 # ~(8/3)*d_model, multiple of 256
     rms_eps: float = 1e-5
     tie_embeddings: bool = True
-    qk_norm: bool = True             # Gemma-3/4 style; replaces logit softcapping
-    global_every: int = 4            # 3 sliding-window layers : 1 global  (4:1)
+    qk_norm: bool = True             # RMSNorm on q/k; kills attention-logit blowup in low precision
+    global_every: int = 4            # 3 sliding-window layers : 1 global attention layer
     window: int = 1024
-    rope_local: float = 1e4
+    rope_local: float = 1e4          # Gemma 4 split bases: cheap local, long-range global
     rope_global: float = 1e6
-    hybrid_linear: bool = False      # True + `fla` installed -> gated DeltaNet in SWA slots
-    z_loss: float = 1e-4             # logit-norm regulariser, keeps FP4 logits tame
+    z_loss: float = 1e-4             # keeps the softmax denominator near 1
+    # --- the August-2026 SOTA stack, each independently switchable ---------
+    hybrid_linear: bool = True       # gated DeltaNet in the non-global slots when `fla` is present
+    attn_sinks: bool = True          # learnable per-head sink logit (StreamingLLM / GPT-OSS)
+    partial_rope: float = 0.25       # Gemma 4 pp-RoPE: rotate this fraction of dims on global layers
+    intra_doc_mask: bool = True      # never attend across a document boundary inside a packed seq
+    mtp_depth: int = 1               # multi-token prediction heads (DeepSeek-V3); 0 disables
+    mtp_weight: float = 0.3
+    moe: bool = False                # MoE FFN; memory-bound on 12 GB, on by default from
+    moe_experts: int = 8             # `workstation` upward
+    moe_top_k: int = 2
+    moe_shared: int = 1              # always-on shared expert (DeepSeek-V3 / Qwen3)
+    moe_bias_speed: float = 1e-3     # aux-loss-free load balancing via router bias nudging
+    ema_decay: float = 0.0           # >0 keeps an EMA copy of the weights for the final checkpoint
 
-    # ---- data
+    # ---- data: CHAT-first mixture (this is a conversational model, not a code model)
     seq_len: int = 2048
-    micro_batch: int = 1
-    grad_accum: int = 32
+    micro_batch: int = 2
+    grad_accum: int = 8
     aletheia_epochs: int = 24        # the OS repo is tiny: upsample it hard
     mix: dict = field(default_factory=lambda: {
-        "nemotron_cc_hq": 0.34, "fineweb_edu": 0.20, "dclm": 0.10,
-        "code": 0.18, "math": 0.06, "aletheia": 0.08, "chat": 0.04,
+        "nemotron_cc_hq": 0.34, "fineweb_edu": 0.20, "dclm": 0.08,
+        "chat": 0.14, "code": 0.11, "math": 0.05, "aletheia": 0.08,
     })
 
-    # ---- budget / schedule (WSD: warmup - stable - 1-sqrt decay)
-    tokens_per_param: int = 13_000   # LFM2.5-2.6B ratio; Chinchilla (~20) deliberately ignored
+    # ---- budget / schedule (warmup - hold - cosine decay)
+    train_days: float = 14.0         # wall-clock budget; steps are derived from measured tok/s
+    tokens_per_param: int = 13_000   # aspiration (LFM2.5 ratio). The cell reports what fits.
+    total_steps: int = 0             # >0 pins the step count and ignores both knobs above
     warmup_frac: float = 0.01
-    decay_frac: float = 0.20
-    lr_muon: float = 2e-2            # 2D hidden matrices
-    lr_adamw: float = 3e-3           # embeddings / norms / 1D
-    min_lr_frac: float = 0.01
-    weight_decay: float = 0.1
+    hold_frac: float = 0.40          # hold at peak after warmup, then cosine to lr_min
+    lr_muon: float = 2.0e-3          # 2D hidden matrices
+    lr_adamw: float = 3.0e-4         # embeddings / norms / 1D
+    lr_min: float = 3.0e-5
+    weight_decay: float = 0.1        # arXiv:2509.14786 suggests ~1.6 at this scale; unswept
     grad_clip: float = 1.0
+    fp32_master: bool = True         # FP32 master weights, bf16/FP4 compute
 
     # ---- precision
     precision: str = "auto"          # auto | nvfp4 | mxfp8 | fp8 | bf16
@@ -230,25 +261,28 @@ class Cfg:
 
 cfg = Cfg()
 
-if PRESET == "laptop":
-    cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads = 1024, 16, 8, 2
-    cfg.seq_len, cfg.micro_batch, cfg.grad_accum = 1024, 1, 16
-    cfg.tok_corpus_gb, cfg.tokens_per_param = 0.5, 400
-elif PRESET == "workstation":
-    cfg.micro_batch, cfg.grad_accum = 4, 16
-elif PRESET == "cluster":
-    cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads = 2048, 30, 16, 4
-    cfg.seq_len, cfg.micro_batch, cfg.grad_accum = 4096, 8, 24
-    cfg.compile = True
+if PRESET == "rtx5070":                 # 12 GB consumer Blackwell, the machine this was written on
+    pass                                # defaults are already this shape
+elif PRESET == "workstation":           # 48-96 GB (RTX PRO 6000 / H200)
+    cfg.d_model, cfg.n_layers, cfg.head_dim = 1536, 28, 128
+    cfg.n_heads, cfg.n_kv_heads, cfg.d_ff = 12, 4, 4096
+    cfg.micro_batch, cfg.grad_accum = 8, 4
+    cfg.moe, cfg.train_days = True, 30.0
+elif PRESET == "cluster":               # multi-node B200
+    cfg.d_model, cfg.n_layers, cfg.head_dim = 2048, 32, 128
+    cfg.n_heads, cfg.n_kv_heads, cfg.d_ff = 16, 4, 5632
+    cfg.seq_len, cfg.micro_batch, cfg.grad_accum = 4096, 16, 8
+    cfg.moe, cfg.moe_experts, cfg.train_days = True, 32, 60.0
 
 if cfg.precision == "auto":
     cfg.precision = PRECISION_PATH
 
-D_FF = int(round(cfg.d_model * cfg.ffn_mult / 256) * 256)
-for d in (cfg.d_model, D_FF, cfg.vocab_size):
+D_FF = cfg.d_ff
+for d in (cfg.d_model, D_FF, cfg.vocab_size, cfg.n_heads * cfg.head_dim,
+          cfg.n_kv_heads * cfg.head_dim):
     assert d % 128 == 0, f"{d} must be a multiple of 128 for FP4/FP8 GEMM alignment"
 assert cfg.n_heads % cfg.n_kv_heads == 0
-assert cfg.head_dim * cfg.n_heads >= cfg.d_model or True   # head_dim may exceed d_model/n_heads
+assert cfg.vocab_size <= 65536, "uint16 shards require vocab <= 65536"
 
 for sub in ("shards", "ckpt", "tokenizer", "corpus", "logs"):
     (cfg.root / sub).mkdir(parents=True, exist_ok=True)
@@ -257,28 +291,52 @@ torch.manual_seed(cfg.seed)
 
 def param_estimate(c: Cfg, d_ff: int):
     emb = c.vocab_size * c.d_model
-    per_layer = (
-        c.d_model * c.n_heads * c.head_dim            # q
-        + 2 * c.d_model * c.n_kv_heads * c.head_dim   # k, v
-        + c.n_heads * c.head_dim * c.d_model          # o
-        + 3 * c.d_model * d_ff                        # swiglu
-        + 4 * c.d_model                               # norms
-    )
+    attn = (c.d_model * c.n_heads * c.head_dim + 2 * c.d_model * c.n_kv_heads * c.head_dim
+            + c.n_heads * c.head_dim * c.d_model)
+    ffn = 3 * c.d_model * d_ff
+    if c.moe:
+        ffn = ffn * (c.moe_experts + c.moe_shared) + c.d_model * c.moe_experts
+    per_layer = attn + ffn + 4 * c.d_model
     body = c.n_layers * per_layer + c.d_model
-    return emb + body + (0 if c.tie_embeddings else emb), body
+    body += c.mtp_depth * (attn + 3 * c.d_model * d_ff)          # MTP blocks
+    active = c.n_layers * (attn + (3 * c.d_model * d_ff * (c.moe_top_k + c.moe_shared)
+                                   if c.moe else 3 * c.d_model * d_ff))
+    return emb + body + (0 if c.tie_embeddings else emb), body, active
 
-TOTAL_PARAMS, NONEMB_PARAMS = param_estimate(cfg, D_FF)
-TOKEN_BUDGET = cfg.tokens_per_param * NONEMB_PARAMS
+TOTAL_PARAMS, NONEMB_PARAMS, ACTIVE_PARAMS = param_estimate(cfg, D_FF)
 TOKENS_PER_STEP = cfg.seq_len * cfg.micro_batch * cfg.grad_accum
-TOTAL_STEPS = max(1, TOKEN_BUDGET // TOKENS_PER_STEP)
 
-print(f"preset            : {PRESET}")
-print(f"precision         : {cfg.precision}")
-print(f"d_model/layers    : {cfg.d_model} x {cfg.n_layers}   d_ff={D_FF}")
-print(f"params (total)    : {TOTAL_PARAMS/1e9:.3f}B   non-embedding: {NONEMB_PARAMS/1e9:.3f}B")
-print(f"token budget      : {TOKEN_BUDGET/1e9:.1f}B  ({cfg.tokens_per_param} tok/param)")
+# Throughput prior, refined by the benchmark cell later. Blackwell BF16 tok/s per GFLOP-of-model,
+# fitted to the published RTX 5090 / B200 TE numbers; only used to turn `train_days` into steps.
+TPS_PRIOR = {"RTX 5070": 9_000, "RTX 5080": 16_000, "RTX 5090": 34_000,
+             "RTX PRO 6000": 42_000, "B200": 190_000}
+TPS_GUESS = next((v for k, v in TPS_PRIOR.items() if k.split()[-1] in GPU), 6_000)
+TPS_GUESS = TPS_GUESS * (280e6 / max(ACTIVE_PARAMS, 1)) ** 0.9
+
+BUDGET_ASPIRATION = cfg.tokens_per_param * NONEMB_PARAMS
+BUDGET_WALLCLOCK = int(cfg.train_days * 86_400 * TPS_GUESS)
+TOKEN_BUDGET = BUDGET_WALLCLOCK if not cfg.total_steps else cfg.total_steps * TOKENS_PER_STEP
+TOTAL_STEPS = cfg.total_steps or max(1, TOKEN_BUDGET // TOKENS_PER_STEP)
+WARMUP = max(1, int(TOTAL_STEPS * cfg.warmup_frac))
+
+print(f"preset            : {PRESET}   precision: {cfg.precision}")
+print(f"d_model/layers    : {cfg.d_model} x {cfg.n_layers}   d_ff={D_FF}"
+      f"   heads {cfg.n_heads}/{cfg.n_kv_heads} x {cfg.head_dim}")
+print(f"params            : {TOTAL_PARAMS/1e6:.1f}M total | {NONEMB_PARAMS/1e6:.1f}M non-embedding"
+      f" | {ACTIVE_PARAMS/1e6:.1f}M active/token")
+print(f"sota stack        : hybrid_linear={cfg.hybrid_linear} sinks={cfg.attn_sinks}"
+      f" pp-rope={cfg.partial_rope} intra_doc={cfg.intra_doc_mask} mtp={cfg.mtp_depth}"
+      f" moe={cfg.moe} ema={cfg.ema_decay or 'off'}")
 print(f"tokens/step       : {TOKENS_PER_STEP:,}   steps: {TOTAL_STEPS:,}")
+print(f"budget (wall)     : {TOKEN_BUDGET/1e9:.1f}B tokens in {cfg.train_days:.0f} days"
+      f" at ~{TPS_GUESS:,.0f} tok/s  ->  {TOKEN_BUDGET/NONEMB_PARAMS:,.0f} tok/param")
 print(f"BF16 switch at    : step {int(TOTAL_STEPS*cfg.bf16_switch_frac):,}")
+print()
+print(f"reality check     : {cfg.tokens_per_param:,} tok/param would need "
+      f"{BUDGET_ASPIRATION/1e12:.2f}T tokens = {BUDGET_ASPIRATION/TPS_GUESS/86400/365:.1f} GPU-years"
+      f" here.\n                    LFM2.5-2.6B spent ~34T tokens to reach that ratio. On this box "
+      f"the honest\n                    target is the wall-clock budget above; raise `train_days`, "
+      f"or move the same\n                    notebook to a `cluster` preset to close the gap.")
 """)
 
 # ---------------------------------------------------------------- 3. tokenizer
@@ -357,7 +415,7 @@ def build_tokenizer_corpus(target_gb: float) -> Path:
     budget = int(target_gb * 1e9)
     # Aletheia OS gets an outsized share of the tokenizer corpus on purpose: its identifiers
     # (`CapabilityRef`, `ContextFabric`, `IntentEnvelope`) must be single tokens.
-    quota = {"aletheia": 0.18, "prose": 0.46, "code": 0.26, "math": 0.10}
+    quota = {"aletheia": 0.12, "prose": 0.58, "code": 0.22, "math": 0.08}
     written = {k: 0 for k in quota}
     t0 = time.time()
     with open(CORPUS, "w", encoding="utf-8") as out:
@@ -433,15 +491,16 @@ from collections import Counter
 
 from tokenizers import Regex, Tokenizer, decoders, models, pre_tokenizers, processors, trainers
 
-# GPT-4 style pretokenisation regex: keeps stage 1 inside words, splits digits in 1-3 groups,
-# and keeps leading spaces attached to words (the ' fn' / ' let' pieces code models need).
+# Stage-1 split regex. This is the `xw` variant measured in aletheia-lm/docs/TOKENIZER-V3.md:
+# a leading whitespace *run* attaches to the token that follows, so `\n    return` and `);\n` can
+# become single pieces. That change alone was worth +8.6% bytes/token at fixed vocabulary there --
+# the largest single tokenizer effect in that sweep. Numeric literals are also kept whole.
 GPT4_SPLIT_PATTERN = (
-    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)"
-    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
-    r"|\p{N}{1,3}"
-    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
-    r"|\s*[\r\n]"
-    r"|\s+(?!\S)"
+    r"'(?i:[sdmt]|ll|ve|re)"
+    r"|(?i:0x[0-9a-f][0-9a-f_]*|0b[01][01_]*|0o[0-7][0-7_]*)"
+    r"|\s*[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\s*\p{N}{1,3}"
+    r"|\s*[^\s\p{L}\p{N}]+[\r\n]*"
     r"|\s+"
 )
 
@@ -682,6 +741,10 @@ encoders = [
     ("SuperBPE 65k (ours)", lambda t: tokenizer.encode(t, add_special_tokens=False).ids),
     ("stage-1 BPE (no superwords)", lambda t: stage1.encode(t, add_special_tokens=False).ids),
 ]
+v3_json = cfg.lm_repo / "test" / "aletheia_tok_v3" / "tokenizer.json"
+if v3_json.exists():                       # baseline only -- nothing is initialised from it
+    _v3 = Tokenizer.from_file(str(v3_json))
+    encoders.append(("aletheia_tok_v3 32k xw", lambda t: _v3.encode(t, add_special_tokens=False).ids))
 old_sp = Path("aletheiacode64k.model")
 if old_sp.exists():
     import sentencepiece as spm
@@ -917,29 +980,31 @@ train_iter = infinite(train_loader)
 md(r"""
 ## 5. Architecture
 
-A dense decoder — deliberately, not a linear-attention hybrid by default. Two reasons: (a) NVFP4
-GEMMs come from Transformer Engine's `Linear`, and every FP4 result cited above was measured on
-Transformer/hybrid-Mamba stacks whose *linear layers* are the quantized part; (b) hybrid conversion
-quality is layer-selection-sensitive (FlashMorph, arXiv:2606.30562) — a research axis, not a default.
-`cfg.hybrid_linear=True` swaps gated DeltaNet into the sliding-window slots when
-`flash-linear-attention` is installed.
+Every architectural component that was state of the art in August 2026 and is compatible with 4-bit
+training is here and **on by default**, each behind its own flag so any one of them can be ablated:
 
-Components, each with its August-2026 justification:
+| component | what it does | source |
+|---|---|---|
+| **Hybrid attention 3:1** | 3 efficient layers per full-attention layer. Efficient = **gated DeltaNet** (linear attention) when `flash-linear-attention` is installed, otherwise **sliding-window attention** (1024) | Qwen3-Next / Nemotron-Flash arXiv:2511.18890 / MiniCPM-SALA; ratio from Gemma 4 arXiv:2607.02770 (4:1–5:1) and Mellum2 arXiv:2605.31268 (3:1). Layer *placement* matters more than the ratio — FlashMorph arXiv:2606.30562 — so the full-attention layers are evenly spaced, the one placement that survives every study |
+| **GQA 4:1** | 16 query heads, 4 KV heads | KV cache is the binding constraint for an OS-resident chat model |
+| **QK-norm** | RMSNorm on q and k | Gemma 3/4. Replaces logit soft-capping, which costs ~15% throughput in the TE nanochat measurements, and bounds attention logits — worth more in 4-bit than in BF16 |
+| **Attention sinks** | learnable per-head sink key with a zero value: it takes softmax mass without contributing to the output | StreamingLLM / GPT-OSS. This is what makes windowed attention stable when the window slides past the prompt |
+| **pp-RoPE** | rotate only the first 25% of head dims on **global** layers, full RoPE at θ=10k on local layers, θ=1M on global | Gemma 4's `p=0.25` split-base scheme. Partial rotation leaves clean unrotated channels for long-range content |
+| **Pre + post norm** | RMSNorm on both sides of every sublayer | Gemma 4. The residual-stream stabiliser that keeps 4-bit forward passes from drifting |
+| **SwiGLU / no biases / tied embeddings** | — | universal in 2026 dense stacks |
+| **MoE FFN** (`cfg.moe`) | top-2 of 8 routed experts + 1 always-on shared expert, **aux-loss-free** load balancing by nudging per-expert router bias | DeepSeek-V3 bias-balancing, Qwen3/Gemma 4 26B-A4B shared-expert shape. Off on 12 GB — MoE trades memory for FLOPs and memory is what a 5070 lacks — on from the `workstation` preset up |
+| **Multi-token prediction** | one extra block predicting `t+2`, loss weight 0.3; also gives free speculative decoding at inference | DeepSeek-V3 MTP. A data-efficiency win, which is exactly what an overtrained run wants |
+| **Intra-document masking** | tokens never attend across an `<\|eos\|>` boundary inside a packed sequence | standard 2025-26 pretraining hygiene; packing without it teaches spurious cross-document dependence |
+| **z-loss 1e-4 + FP32 logits** | keeps `logsumexp` bounded | logits are never FP4 |
+| **Depth-scaled init** | residual projections initialised at `d_model^-0.5 / sqrt(2·n_layers)` | GPT-NeoX / OLMo |
+| **Precision policy** | first 2 + last 4 blocks BF16; embeddings, LM head, norms, attention, optimizer state never FP4 | arXiv:2509.25149's 16%-BF16 rule |
 
-* **GQA** `n_heads:n_kv_heads = 4:1` — KV cache is the binding constraint for on-device chat.
-* **QK-norm** (RMSNorm on q and k) — Gemma 3/4's replacement for logit soft-capping. Soft-capping
-  costs ~15% throughput in the TE nanochat experiments; QK-norm costs almost nothing and is what
-  actually keeps attention logits bounded, which matters more in 4-bit.
-* **Sliding-window : global = 3:1** with window 1024 — Gemma 4 uses 4:1/5:1 local:global. Cheap
-  long-context with intact global recall.
-* **Split RoPE bases**: 10k on local layers, 1M on global layers (Gemma 4).
-* **Pre-norm + post-norm RMSNorm** per sublayer — the residual-stream stabiliser that makes 4-bit
-  forward passes behave.
-* **SwiGLU**, no biases anywhere.
-* **Tied embeddings** — at 65k×d_model, tying is ~10% of parameters back into depth.
-* **z-loss** `1e-4` — keeps `logsumexp` small so BF16 logits (never FP4) don't drift.
-* **Precision policy per layer**: `NVFP4Policy` keeps the first 2 and last N blocks' linears in BF16,
-  per arXiv:2509.25149's 16%-BF16 rule, and never quantizes embeddings, LM head, norms or attention.
+**Deliberately declined**, with reasons, because "everything SOTA" also means not stacking things
+that fight each other: full sparse attention (InfLLM-v2) — its win is at ≥128k context, which this
+model does not train at; Mamba-2/SSM blocks — gated DeltaNet already occupies that slot and TE's FP4
+path covers `Linear`, not scan kernels; hyper-connections and value-residual variants — promising but
+each one invalidates the depth-scaled init that the 4-bit run depends on; MLA (DeepSeek-style latent
+KV) — a real KV-cache win, but it interacts with pp-RoPE in ways nobody has published at this scale.
 """)
 
 code(r"""
@@ -972,6 +1037,28 @@ class RMSNorm(nn.Module):
         return (x.to(dt) * self.w)
 
 
+def build_masks(idx, device):
+    # One mask set per forward, shared by every layer. Combines: causal, sliding window,
+    # intra-document (never attend across <|eos|>), and a leading always-visible sink column.
+    B, L = idx.shape
+    i = torch.arange(L, device=device)
+    causal = i[:, None] >= i[None, :]
+    local = causal & ((i[:, None] - i[None, :]) < cfg.window)
+    if cfg.intra_doc_mask:
+        doc = (idx == EOS_ID).cumsum(-1)                       # document id per position
+        doc = doc - (idx == EOS_ID).long()                     # the EOS itself ends its own doc
+        same = doc[:, :, None] == doc[:, None, :]              # (B, L, L)
+        causal = causal[None] & same
+        local = local[None] & same
+    else:
+        causal, local = causal[None].expand(B, L, L), local[None].expand(B, L, L)
+    if cfg.attn_sinks:                                          # sink column is always visible
+        ones = torch.ones(B, L, 1, dtype=torch.bool, device=device)
+        causal = torch.cat([ones, causal], -1)
+        local = torch.cat([ones, local], -1)
+    return causal[:, None], local[:, None]                      # (B, 1, L, L(+1))
+
+
 def rope_cache(seq: int, dim: int, base: float, device, dtype=torch.float32):
     inv = 1.0 / (base ** (torch.arange(0, dim, 2, device=device, dtype=dtype) / dim))
     t = torch.arange(seq, device=device, dtype=dtype)
@@ -979,16 +1066,20 @@ def rope_cache(seq: int, dim: int, base: float, device, dtype=torch.float32):
     return torch.cos(f), torch.sin(f)
 
 
-def apply_rope(x, cos, sin):
+def apply_rope(x, cos, sin, frac: float = 1.0):
     # x: (B, H, L, D). Rotation runs in fp32 (cos/sin are fp32) and comes back in x's dtype so
-    # q/k/v stay type-consistent for SDPA.
+    # q/k/v stay type-consistent for SDPA. `frac` < 1 is Gemma 4's pp-RoPE: only the first
+    # `frac` of the head dimension is rotated, the rest passes through unrotated.
     dt = x.dtype
-    xf = x.float()
-    x1, x2 = xf[..., ::2], xf[..., 1::2]
-    c, s = cos[None, None], sin[None, None]
+    d = x.shape[-1]
+    r = d if frac >= 1.0 else max(2, int(d * frac) // 2 * 2)
+    xr, xp = x[..., :r].float(), x[..., r:]
+    x1, x2 = xr[..., ::2], xr[..., 1::2]
+    c, s = cos[None, None, :, : r // 2], sin[None, None, :, : r // 2]
     o1 = x1 * c - x2 * s
     o2 = x1 * s + x2 * c
-    return torch.stack((o1, o2), dim=-1).flatten(-2).to(dt)
+    out = torch.stack((o1, o2), dim=-1).flatten(-2).to(dt)
+    return out if r == d else torch.cat([out, xp], -1)
 
 
 class Attention(nn.Module):
@@ -998,6 +1089,7 @@ class Attention(nn.Module):
         self.is_global = (idx + 1) % cfg.global_every == 0
         self.window = None if self.is_global else cfg.window
         self.nh, self.nkv, self.hd = cfg.n_heads, cfg.n_kv_heads, cfg.head_dim
+        self.rope_frac = cfg.partial_rope if self.is_global else 1.0   # Gemma 4 pp-RoPE
         L = linear_factory("attn", idx)
         self.q_proj = L(cfg.d_model, self.nh * self.hd)
         self.k_proj = L(cfg.d_model, self.nkv * self.hd)
@@ -1005,8 +1097,12 @@ class Attention(nn.Module):
         self.o_proj = L(self.nh * self.hd, cfg.d_model)
         self.q_norm = RMSNorm(self.hd, cfg.rms_eps) if cfg.qk_norm else nn.Identity()
         self.k_norm = RMSNorm(self.hd, cfg.rms_eps) if cfg.qk_norm else nn.Identity()
+        # Attention sink: a learnable key with a hard-zero value. It absorbs softmax mass that
+        # would otherwise be forced onto real tokens when the window slides past the prompt.
+        self.sink_k = nn.Parameter(torch.zeros(1, self.nkv, 1, self.hd, dtype=BF16)) \
+            if cfg.attn_sinks else None
 
-    def forward(self, x, rope, cache=None):
+    def forward(self, x, rope, masks, cache=None):
         B, L, _ = x.shape
         q = self.q_proj(x).view(B, L, self.nh, self.hd).transpose(1, 2)
         k = self.k_proj(x).view(B, L, self.nkv, self.hd).transpose(1, 2)
@@ -1014,40 +1110,83 @@ class Attention(nn.Module):
         q, k = self.q_norm(q), self.k_norm(k)
         cos, sin = rope[1 if self.is_global else 0]
         off = 0 if cache is None or cache[0] is None else cache[0].shape[2]
-        q = apply_rope(q, cos[off:off + L], sin[off:off + L])
-        k = apply_rope(k, cos[off:off + L], sin[off:off + L])
+        q = apply_rope(q, cos[off:off + L], sin[off:off + L], self.rope_frac)
+        k = apply_rope(k, cos[off:off + L], sin[off:off + L], self.rope_frac)
+        new_cache = None
         if cache is not None:
             if cache[0] is not None:
                 k = torch.cat([cache[0], k], 2); v = torch.cat([cache[1], v], 2)
             if self.window and k.shape[2] > self.window:
                 k, v = k[:, :, -self.window:], v[:, :, -self.window:]
             new_cache = (k, v)
-        # attention math itself stays BF16: arXiv:2509.25149 keeps attention out of FP4.
+        if self.sink_k is not None:
+            sk = self.sink_k.expand(B, -1, -1, -1).to(k.dtype)
+            k = torch.cat([sk, k], 2)
+            v = torch.cat([torch.zeros_like(sk), v], 2)      # zero value -> denominator only
+        # The attention math itself stays BF16: arXiv:2509.25149 keeps attention out of FP4.
         kw = {"enable_gqa": True} if self.nkv != self.nh else {}
-        if cache is not None and L == 1:
+        if cache is not None:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=False, **kw)
         else:
-            mask = None
-            if self.window:
-                i = torch.arange(L, device=x.device)
-                mask = (i[:, None] >= i[None, :]) & (i[:, None] - i[None, :] < self.window)
-                out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask[None, None], **kw)
-            else:
-                out = F.scaled_dot_product_attention(q, k, v, is_causal=True, **kw)
+            mask = masks[1 if self.is_global else 0]
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, **kw)
         out = out.transpose(1, 2).reshape(B, L, self.nh * self.hd)
         out = self.o_proj(out)
         return (out, new_cache) if cache is not None else out
 
 
 class SwiGLU(nn.Module):
-    def __init__(self, idx: int):
+    def __init__(self, idx: int, d_ff: int = None):
         super().__init__()
+        d_ff = d_ff or D_FF
         L = linear_factory("ffn", idx)
-        self.gate_proj, self.up_proj = L(cfg.d_model, D_FF), L(cfg.d_model, D_FF)
-        self.down_proj = L(D_FF, cfg.d_model)
+        self.gate_proj, self.up_proj = L(cfg.d_model, d_ff), L(cfg.d_model, d_ff)
+        self.down_proj = L(d_ff, cfg.d_model)
 
     def forward(self, x):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class MoEFFN(nn.Module):
+    # Top-k routed experts + an always-on shared expert, with DeepSeek-V3's aux-loss-free load
+    # balancing: no auxiliary loss term, just a per-expert bias nudged toward even utilisation.
+    def __init__(self, idx: int):
+        super().__init__()
+        self.experts = nn.ModuleList(SwiGLU(idx) for _ in range(cfg.moe_experts))
+        self.shared = nn.ModuleList(SwiGLU(idx) for _ in range(cfg.moe_shared))
+        self.router = nn.Linear(cfg.d_model, cfg.moe_experts, bias=False, dtype=BF16)
+        self.register_buffer("bias", torch.zeros(cfg.moe_experts, dtype=torch.float32))
+        self.register_buffer("load", torch.zeros(cfg.moe_experts, dtype=torch.float32))
+
+    def forward(self, x):
+        B, L, D = x.shape
+        flat = x.reshape(-1, D)
+        logits = self.router(flat).float()
+        gate = logits.sigmoid()
+        top = (gate + self.bias).topk(cfg.moe_top_k, dim=-1).indices
+        w = gate.gather(-1, top)
+        w = w / w.sum(-1, keepdim=True).clamp(min=1e-6)
+        out = torch.zeros_like(flat)
+        for e, expert in enumerate(self.experts):
+            hit = (top == e)
+            if not hit.any():
+                continue
+            rows = hit.any(-1).nonzero(as_tuple=True)[0]
+            wr = (w * hit.float()).sum(-1)[rows].unsqueeze(-1).to(flat.dtype)
+            out.index_add_(0, rows, expert(flat[rows]) * wr)
+            if self.training:
+                self.load[e] += rows.numel()
+        for sh in self.shared:
+            out = out + sh(flat)
+        return out.view(B, L, D)
+
+    @torch.no_grad()
+    def rebalance(self):
+        if not cfg.moe or self.load.sum() == 0:
+            return
+        share = self.load / self.load.sum()
+        self.bias -= cfg.moe_bias_speed * (share - 1.0 / cfg.moe_experts).sign()
+        self.load.zero_()
 
 
 class Block(nn.Module):
@@ -1057,11 +1196,13 @@ class Block(nn.Module):
         self.pre_attn, self.post_attn = RMSNorm(cfg.d_model, cfg.rms_eps), RMSNorm(cfg.d_model, cfg.rms_eps)
         self.pre_ffn, self.post_ffn = RMSNorm(cfg.d_model, cfg.rms_eps), RMSNorm(cfg.d_model, cfg.rms_eps)
         self.mixer = self._make_mixer(idx)
-        self.ffn = SwiGLU(idx)
+        self.ffn = MoEFFN(idx) if cfg.moe else SwiGLU(idx)
         # tag the residual-output projections so _init can depth-scale their std
         if isinstance(self.mixer, Attention):
             self.mixer.o_proj._is_residual_out = True
-        self.ffn.down_proj._is_residual_out = True
+        for m in self.ffn.modules():
+            if isinstance(m, SwiGLU):
+                m.down_proj._is_residual_out = True
 
     def _make_mixer(self, idx):
         if cfg.hybrid_linear and HAS_FLA and (idx + 1) % cfg.global_every != 0:
@@ -1070,17 +1211,17 @@ class Block(nn.Module):
                                  expand_v=1, use_gate=True).to(BF16)
         return Attention(idx)
 
-    def forward(self, x, rope, cache=None):
+    def forward(self, x, rope, masks, cache=None):
         h = self.pre_attn(x)
+        new_cache = cache
         if isinstance(self.mixer, Attention):
             if cache is not None:
-                h, new_cache = self.mixer(h, rope, cache)
+                h, new_cache = self.mixer(h, rope, masks, cache)
             else:
-                h = self.mixer(h, rope)
+                h = self.mixer(h, rope, masks)
         else:
             out = self.mixer(h)                      # gated DeltaNet returns (o, ...) in fla
             h = out[0] if isinstance(out, tuple) else out
-            new_cache = cache
         x = x + self.post_attn(h)
         x = x + self.post_ffn(self.ffn(self.pre_ffn(x)))
         return (x, new_cache) if cache is not None else x
@@ -1095,6 +1236,11 @@ class AletheiaChat(nn.Module):
         self.lm_head = nn.Linear(cfg.d_model, VOCAB_SIZE_ACTUAL, bias=False, dtype=BF16)
         if cfg.tie_embeddings:
             self.lm_head.weight = self.embed.weight
+        # Multi-token prediction (DeepSeek-V3): extra blocks predicting t+2, t+3, ... They share
+        # the LM head, are trained with weight `mtp_weight`, and are dropped at export unless you
+        # want speculative decoding.
+        self.mtp = nn.ModuleList(Block(cfg.n_layers - 1) for _ in range(cfg.mtp_depth))
+        self.mtp_norm = nn.ModuleList(RMSNorm(cfg.d_model, cfg.rms_eps) for _ in range(cfg.mtp_depth))
         self._rope = None
         self.apply(self._init)
 
@@ -1115,21 +1261,19 @@ class AletheiaChat(nn.Module):
                           rope_cache(n, cfg.head_dim, cfg.rope_global, device))
         return self._rope
 
-    def hidden(self, idx):
+    def hidden(self, idx, want_pre_norm: bool = False):
         rope = self.rope(idx.device)
+        masks = build_masks(idx, idx.device)
         h = self.embed(idx)
         for b in self.blocks:
             if cfg.act_ckpt and self.training:
-                h = torch.utils.checkpoint.checkpoint(b, h, rope, use_reentrant=False)
+                h = torch.utils.checkpoint.checkpoint(b, h, rope, masks, use_reentrant=False)
             else:
-                h = b(h, rope)
-        return self.norm(h)
+                h = b(h, rope, masks)
+        return (self.norm(h), h, rope, masks) if want_pre_norm else self.norm(h)
 
-    def forward(self, idx, targets=None, loss_mask=None):
-        h = self.hidden(idx)
+    def _ce(self, h, targets, loss_mask):
         logits = self.lm_head(h).float()             # logits always FP32 for the softmax
-        if targets is None:
-            return logits
         ce = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.reshape(-1),
                              reduction="none")
         if loss_mask is not None:
@@ -1142,6 +1286,21 @@ class AletheiaChat(nn.Module):
             ce = ce + cfg.z_loss * lse.pow(2).mean()
         return ce
 
+    def forward(self, idx, targets=None, loss_mask=None):
+        if targets is None:
+            return self.lm_head(self.hidden(idx)).float()
+        h, pre, rope, masks = self.hidden(idx, want_pre_norm=True)
+        loss = self._ce(h, targets, loss_mask)
+        # --- multi-token prediction: head d predicts token t+1+d ------------
+        for d, (blk, nrm) in enumerate(zip(self.mtp, self.mtp_norm), start=1):
+            if idx.shape[1] <= d:
+                break
+            hp = blk(pre, rope, masks)
+            tgt = targets[:, d:]
+            lm = None if loss_mask is None else loss_mask[:, d:]
+            loss = loss + cfg.mtp_weight * self._ce(nrm(hp)[:, :-d], tgt, lm)
+        return loss
+
     @torch.no_grad()
     def generate(self, idx, max_new_tokens=256, temperature=0.7, top_p=0.9,
                  rep_penalty=1.05, stop_ids=(EOS_ID,)):
@@ -1153,7 +1312,7 @@ class AletheiaChat(nn.Module):
             h = self.embed(cur)
             new = []
             for b, c in zip(self.blocks, caches):
-                h, nc = b(h, rope, cache=c)
+                h, nc = b(h, rope, None, cache=c)
                 new.append(nc)
             caches = new
             logits = self.lm_head(self.norm(h))[:, -1].float()
@@ -1324,34 +1483,84 @@ if MuonCls is None:
                     p.add_(upd.to(p.dtype), alpha=-g["lr"])
     print("[!] torch.optim.Muon unavailable -> bundled implementation")
 
-opt_muon = MuonCls(hidden2d, lr=cfg.lr_muon, momentum=0.95, ns_steps=5,
-                   weight_decay=cfg.weight_decay)
-opt_adamw = torch.optim.AdamW(other, lr=cfg.lr_adamw, betas=(0.9, 0.95), eps=1e-8,
-                              weight_decay=0.0, fused=HAS_CUDA)
+# ---- FP32 master weights -----------------------------------------------------
+# Compute runs in BF16/NVFP4; the optimizer owns an FP32 copy. Without this, a bf16 master weight
+# has 2**-8 relative resolution, so late-training updates below half the representable spacing
+# round to zero and the embedding path silently stops learning through the whole decay phase.
+class MasterWeights:
+    def __init__(self, params, enabled=True):
+        self.enabled = enabled
+        self.pairs = [(p, p.detach().float().clone()) for p in params] if enabled else []
+        for _, m in self.pairs:
+            m.requires_grad_(True)
+
+    def to_master(self):
+        for p, m in self.pairs:
+            m.grad = p.grad.float() if p.grad is not None else None
+
+    def to_model(self):
+        for p, m in self.pairs:
+            p.data.copy_(m.data.to(p.dtype))
+
+    @property
+    def master_params(self):
+        return [m for _, m in self.pairs]
+
+
+class EMA:
+    # Weight EMA: a cheap, uncontroversial final-checkpoint quality gain. Off by default because
+    # it costs one FP32 copy of the model.
+    def __init__(self, model, decay: float):
+        self.decay = decay
+        self.shadow = {k: v.detach().float().clone() for k, v in model.state_dict().items()
+                       if v.dtype.is_floating_point} if decay > 0 else {}
+
+    @torch.no_grad()
+    def update(self, model):
+        if not self.shadow:
+            return
+        for k, v in model.state_dict().items():
+            if k in self.shadow:
+                self.shadow[k].mul_(self.decay).add_(v.float(), alpha=1 - self.decay)
+
+
+master_hidden = MasterWeights(hidden2d, cfg.fp32_master)
+master_other = MasterWeights(other, cfg.fp32_master)
+MASTERS = [master_hidden, master_other]
+
+opt_muon = MuonCls(master_hidden.master_params if cfg.fp32_master else hidden2d,
+                   lr=cfg.lr_muon, momentum=0.95, ns_steps=5, weight_decay=cfg.weight_decay)
+opt_adamw = torch.optim.AdamW(master_other.master_params if cfg.fp32_master else other,
+                              lr=cfg.lr_adamw, betas=(0.9, 0.95), eps=1e-8,
+                              weight_decay=0.0, fused=HAS_CUDA and not cfg.fp32_master)
 OPTS = [opt_muon, opt_adamw]
 BASE_LRS = [cfg.lr_muon, cfg.lr_adamw]
+print(f"master weights: {'fp32' if cfg.fp32_master else 'bf16 (in-place)'}")
 
-WARMUP = max(1, int(TOTAL_STEPS * cfg.warmup_frac))
-DECAY_START = int(TOTAL_STEPS * (1 - cfg.decay_frac))
+DECAY_START = WARMUP + int(TOTAL_STEPS * cfg.hold_frac)
 BF16_SWITCH_STEP = int(TOTAL_STEPS * cfg.bf16_switch_frac)
 
 def lr_scale(step: int) -> float:
+    # Warmup - Hold - Cosine decay. The hold does the learning; the decay can be re-cut later
+    # without having wasted the middle of the run, which matters when the budget is a guess.
     if step < WARMUP:
         return step / WARMUP
     if step < DECAY_START:
         return 1.0
     prog = (step - DECAY_START) / max(1, TOTAL_STEPS - DECAY_START)
-    return max(cfg.min_lr_frac, 1.0 - math.sqrt(prog))       # 1-sqrt decay (WSD)
+    return 0.5 * (1 + math.cos(math.pi * min(prog, 1.0)))
 
 def set_lr(step: int):
     s = lr_scale(step)
     for opt, base in zip(OPTS, BASE_LRS):
         for g in opt.param_groups:
-            g["lr"] = base * s
+            g["lr"] = cfg.lr_min + (base - cfg.lr_min) * s
     return s
 
-print(f"WSD: warmup {WARMUP} | stable -> {DECAY_START} | 1-sqrt decay -> {TOTAL_STEPS}")
-print(f"NVFP4 -> BF16 switch at step {BF16_SWITCH_STEP} ({cfg.bf16_switch_frac:.0%} of tokens)")
+print(f"WHD: warmup {WARMUP:,} | hold -> {DECAY_START:,} | cosine -> {TOTAL_STEPS:,} (floor {cfg.lr_min:g})")
+print(f"NVFP4 -> BF16 switch at step {BF16_SWITCH_STEP:,} ({cfg.bf16_switch_frac:.0%} of tokens)")
+
+ema = EMA(model, cfg.ema_decay)
 """)
 
 # ---------------------------------------------------------------- 8. train
@@ -1443,6 +1652,7 @@ def train(total_steps: int = TOTAL_STEPS, start: int = None):
         if step == BF16_SWITCH_STEP and recipe is not None:
             print(f"\n[precision] step {step}: {cfg.precision.upper()} -> BF16 for the tail")
         scale = set_lr(step)
+        cur_lr = opt_muon.param_groups[0]["lr"]
         for o in OPTS:
             o.zero_grad(set_to_none=True)
         loss_acc = 0.0
@@ -1454,20 +1664,29 @@ def train(total_steps: int = TOTAL_STEPS, start: int = None):
             loss.backward()
             loss_acc += loss.item()
         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip).item()
+        for m in MASTERS:
+            m.to_master()
         for o in OPTS:
             o.step()
+        for m in MASTERS:
+            m.to_model()
+        if cfg.moe:
+            for blk in model.blocks:
+                if isinstance(blk.ffn, MoEFFN):
+                    blk.ffn.rebalance()
+        ema.update(model)
 
         tok = TOKENS_PER_STEP
         telemetry["tok"] += tok; session_tok += tok
         telemetry["step"].append(step); telemetry["loss"].append(loss_acc)
-        telemetry["lr"].append(cfg.lr_muon * scale); telemetry["gnorm"].append(gnorm)
+        telemetry["lr"].append(cur_lr); telemetry["gnorm"].append(gnorm)
         telemetry["precision"].append(cfg.precision if use_q else "bf16")
 
         if step % cfg.eval_every == 0:
             v = evaluate(); telemetry["val"].append([step, v])
         el = max(time.time() - t0, 1e-6)
         bar.set_postfix(loss=f"{loss_acc:.4f}", ppl=f"{math.exp(min(loss_acc,20)):.1f}",
-                        lr=f"{cfg.lr_muon*scale:.2e}", gn=f"{gnorm:.2f}",
+                        lr=f"{cur_lr:.2e}", gn=f"{gnorm:.2f}",
                         tok_s=f"{session_tok/el:,.0f}", prec="q" if use_q else "bf16")
         bar.update(1)
         if step % cfg.save_every == 0 or step == total_steps:

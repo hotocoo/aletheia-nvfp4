@@ -23,8 +23,13 @@ Contents:
 
 ## 1. Starting point
 
-Three of the user's repositories define the baseline. `aletheia-lm` does not exist (404); the
-equivalent work lives in `aletheia1Bmx`.
+`Aletheia-NVFP4` is a **new model**: new tokenizer, new architecture, random init, no distillation
+and no weights from anywhere. This section is therefore not a baseline to extend — it is the local
+*evidence base*, four repositories' worth of measurements that constrain the design choices in §4–§8.
+
+The distinction that matters most: **`aletheia-lm` is a code model, this is a chat model.** They
+share a name and a domain, nothing else. `aletheia-lm` is also **private** — an unauthenticated
+fetch 404s, which is why an earlier pass of this dossier wrongly recorded it as nonexistent.
 
 ### `hotocoo/aletheia` — the knowledge domain
 
@@ -58,12 +63,55 @@ knowledge probe in §11a asserts on exactly these facts.
 `uint32` memmap shards of 500M tokens; chunked cross-entropy (512 rows at a time) to survive the 64k
 vocab logit tensor; checkpoint manifest with `keep=2`.
 
-**Carried forward:** memmap shard pattern (now `uint16` + a document index), checkpoint manifest,
-telemetry/plot structure, chunked-logit thinking (replaced by FP32 logits + z-loss).
-**Replaced:** MLX→CUDA/TE, bfloat16→NVFP4, cosine→WSD, AdamW→Muon+AdamW, code-only data→chat mix,
-`LlamaTokenizer(vocab_file=...)` hack→proper HF fast tokenizer with a chat template.
+**Reused — engineering patterns only, never weights:** the memmap shard layout (now `uint16` plus a
+document index), the checkpoint manifest, and the telemetry/plot structure. Its chunked
+cross-entropy is *not* reused; FP32 logits with a z-loss make it unnecessary.
+**Everything else differs:** MLX→CUDA/TE, bfloat16→NVFP4, cosine→warmup-hold-decay, AdamW→Muon+AdamW,
+code-only data→chat-first mixture, and a `LlamaTokenizer(vocab_file=...)` shim→a tokenizer this
+notebook trains itself.
 
-### `hotocoo/aletheiatokenizer` — the predecessor tokenizer
+### `hotocoo/aletheia-lm` (private) — the code model, and the measurements worth borrowing
+
+A production MLX stack: `src/aletheia_lm/{config,data,hf_ingest,model,tokenizer_train,train}.py`,
+plus `docs/PRETRAIN-SOTA-2026.md` and `docs/TOKENIZER-V3.md`. Its model is 280.8M params
+(248.0M non-embedding), 1024×22, GQA 16/4, SwiGLU 2816, QK-norm, tied embeddings, z-loss 1e-4,
+SWA 1024 at 3:1, RoPE θ=500k, Muon 2e-3 + AdamW 3e-4, warmup-hold-decay, and a live run at
+500,000 steps / 8.192B tokens / 3,032 tok/s measured / 33 tokens per non-embedding parameter,
+every token unique.
+
+Four things from it are used here **as evidence, not as inheritance**:
+
+1. **`TOKENIZER-V3.md`'s five-arm sweep** (2026-08-07, same class of corpus, byte-exact round-trip
+   on every arm). Held-out bytes/token, higher is better:
+
+   | arm | local | hub | comb@0.9 | tok/s | corpus B/s | params |
+   |---|---:|---:|---:|---:|---:|---:|
+   | `aletheia_tok_v2` 64k (shipped) | 3.7048 | 3.1370 | 3.1858 | — | — | 313.6M |
+   | 64k v2 (mixture) — control | 3.7080 | 3.3179 | 3.3532 | 2193 | 7354 | 313.6M |
+   | 32k v2 (mixture) | 3.5210 | 3.1653 | 3.1976 | 2408 | 7700 | 280.8M |
+   | 64k `xw` (mixture) | 4.0100 | 3.6058 | 3.6425 | 2193 | 7988 | 313.6M |
+   | **32k `xw` (mixture)** — adopted | 3.7612 | 3.3842 | 3.4185 | 2408 | **8232** | 280.8M |
+
+   Three isolated effects, each measured: fitting the tokenizer to the actual *mixture* is free on
+   the local half and +5.8% on the Hub half; **lifting the whitespace barrier is +8.6% at fixed
+   vocabulary** — the largest single tokenizer effect, because systems code's most frequent bigrams
+   (`\n    return`, `);\n`, `} else if (`) cross whitespace and a GPT-4-style regex forbids them;
+   and halving 64k→32k costs 6.1% compression but buys 9.8% throughput, netting **+3.1% bytes of
+   corpus per second**. Note `32k xw` beats `64k v2` outright. This is why §4 below trains a
+   32k-class vocabulary with whitespace-crossing merges instead of the 65,536 an earlier draft used.
+2. **The `xw` split regex itself**, reused verbatim as this notebook's stage-1 pretokenizer:
+   `'(?i:[sdmt]|ll|ve|re)|(?i:0x…|0b…|0o…)|\s*[^\r\n\p{L}\p{N}]?\p{L}+|\s*\p{N}{1,3}|\s*[^\s\p{L}\p{N}]+[\r\n]*|\s+`
+3. **`TOKENIZER-V3.md`'s own open item**: a *faithful* SuperBPE run is named as the largest untried
+   tokenizer experiment there, blocked because "`tokenizers` 0.22 has no warm-start path for
+   `BpeTrainer` … a faithful two-stage run needs a fork of the Rust trainer". §4 below unblocks it
+   without a fork — stage 2 is learned over the stage-1 *id stream*, so the Rust trainer is never
+   asked to warm-start.
+4. **A measured defect worth not repeating**: `config.py` records that bf16 master weights (2⁻⁸
+   relative resolution) forced `lr_min` up to 2e-4, so AdamW's decay phase spanned only 1.5× while
+   Muon's spanned 10× — the embedding path effectively never got a decay. This notebook keeps FP32
+   master weights with the cast inside the matmul, and `lr_min` returns to 3e-5.
+
+### `hotocoo/aletheiatokenizer` — the first tokenizer
 
 `aletheiacode64k`: SentencePiece **unigram**, `vocab_size=64000`, `byte_fallback=True`,
 `character_coverage=1.0`, `normalization_rule_name="identity"`, `split_digits=False`,
@@ -234,19 +282,39 @@ result is written back as extra `merges` on a plain HF `BPE` model whose pre-tok
 `ByteLevel(use_regex=False)`, so *inference with pretokenization off* is automatic and the artefact
 loads in vanilla `transformers`.
 
-### 4.4 Vocabulary size
+### 4.4 Vocabulary size — 32768, and why not 64k
 
-**65536.** Divisible by 128 (FP4/FP8 GEMM and TMA tile alignment; TE's `CustomRecipe` even exposes
-`quantization_alignment: int = 128`), and every id fits `uint16`, halving shard bytes versus the
-predecessor's `uint32`. Byte-level coverage means **UNK is unrepresentable**, replacing SentencePiece
-`byte_fallback`. For contrast, Gemma 4 uses 262k — appropriate for a 31B multilingual multimodal
-model, wasteful as 17% of a 1.5B model's parameters.
+Three independent lines of evidence converge on a 32k-class vocabulary, which is why an earlier
+draft's 65,536 was wrong:
+
+1. **Measured locally.** `TOKENIZER-V3.md`'s sweep (§1): 32k `xw` reaches 3.4185 combined bytes/token
+   against 64k `v2`'s 3.3532 — *better compression at half the vocabulary* — and 8232 vs 7354 bytes
+   of corpus consumed per second, because the `[B, L, V]` logit matmul and the tied embedding both
+   halve. Bytes/token alone would have chosen 64k; corpus throughput is the metric that decides.
+2. **Predicted by theory.** *Scaling Laws with Vocabulary* (arXiv:2407.13623, NeurIPS 2024) fits
+   compute-optimal vocabulary against non-vocabulary parameters and lands on 32–38k at ~300M — and
+   states the optimum moves *lower* when data is the bottleneck, which is this run exactly.
+3. **Constraints.** 32768 is divisible by 128 (FP4/FP8 GEMM and TMA tile alignment; TE's
+   `CustomRecipe` exposes `quantization_alignment: int = 128`) and every id fits `uint16`, halving
+   shard bytes. Byte-level coverage makes **UNK unrepresentable**, replacing SentencePiece's
+   `byte_fallback`.
+
+For contrast Gemma 4 uses 262k — right for a 31B multilingual multimodal model, and ~17% of this
+model's parameters if copied blindly.
 
 The bottom 64 ids are reserved: chat surface (`<|system|>`, `<|user|>`, `<|assistant|>`, `<|think|>`,
 `<|tool_call|>`, `<|tool_result|>`, `<|eot|>`), Aletheia pipeline stages (`<|intent|>`, `<|context|>`,
 `<|plan|>`, `<|capability|>`, `<|policy|>`, `<|action|>`, `<|provenance|>`, `<|memory|>`,
 `<|entity|>`, `<|component|>`), source structure (`<|file|>`, `<|code|>`, `<|diff|>`, `<|adr|>`,
 `<|doc|>`), and spare `<|reserved_N|>` slots so future tokens never renumber the vocabulary.
+
+### 4.5 Fitting corpus — chat-first
+
+The tokenizer is fitted to what this model will actually read: ~58% prose (Nemotron-CC-v2,
+FineWeb-Edu), 22% code, 12% Aletheia OS (so `CapabilityRef`, `ContextFabric` and `IntentEnvelope` are
+single tokens), 8% math. `TOKENIZER-V3.md`'s first isolated finding — fitting the tokenizer to the
+*mixture* rather than to one half of it was free on the local half and +5.8% on the other — is the
+reason this is specified as a mixture rather than "the repo".
 
 ---
 
@@ -273,7 +341,7 @@ AI subsystem already pins MiniCPM GGUF references.
 **LFM2.5-2.6B (Liquid AI, Aug 2026)** — 128k context, tool calling, runs on a Raspberry Pi; the
 token-budget reference in §7.
 
-### 5.2 Hybrid attention: surveyed, then declined as a default
+### 5.2 Hybrid attention
 
 - *Rethinking the Role of Efficient Attention in Hybrid Architectures* — arXiv:2606.15378
 - *FlashMorph: Fast LAyer Selection for Hybrid MORPHing* — arXiv:2606.30562: conversion quality
@@ -284,26 +352,48 @@ token-budget reference in §7.
   (arXiv:2606.15007) — hybrid Mamba-Transformer at scale; the NVFP4 paper's own 12B is one of these
 - the widely adopted practice: keep a small fraction of full-attention layers among efficient ones
 
-**Decision.** Default is a **dense decoder with 3 sliding-window layers : 1 global** (`window=1024`,
-`global_every=4`) — it captures most of the KV-cache saving with none of the layer-selection risk, and
-it keeps every mixer matmul inside `te.Linear` where NVFP4 actually applies. `cfg.hybrid_linear=True`
-substitutes `fla`'s gated DeltaNet into the sliding-window slots for anyone who wants to run the
-experiment.
+**Decision.** Hybrid **is** the default: 3 efficient layers per full-attention layer, with the
+efficient slot filled by **gated DeltaNet** when `flash-linear-attention` is present and by
+**sliding-window attention (1024)** otherwise. FlashMorph's finding is about *placement*, not about
+whether to hybridise — so the full-attention layers are evenly spaced, which is the one placement
+every study agrees on, and the fallback path keeps every mixer matmul inside `te.Linear` where NVFP4
+applies. `cfg.hybrid_linear=False` reverts to pure SWA:global for ablation.
 
 ### 5.3 Final configuration and why each element is there
 
+Default preset is `rtx5070`: 1024 × 24, `d_ff=2816`, 16 heads / 4 KV × 64, ~305M params, sized so a
+12 GB card can actually finish a run. `workstation` and `cluster` scale width, depth and MoE.
+
 | Element | Value | Source / reason |
 |---|---|---|
-| depth × width | 30 × 2048 (`cluster`), `d_ff=8192` | all dims %128 for FP4 alignment; deeper than the predecessor's 24 at equal width |
-| GQA | 16 heads / 4 KV, `head_dim=128` | KV cache is the on-device constraint; 4:1 is the Qwen/Llama consensus |
+| depth × width | 24 × 1024, `d_ff=2816` (~8/3·d) | all dims %128 for FP4 alignment; fits 12 GB with FP32 masters + Muon momentum + activations |
+| GQA | 16 heads / 4 KV, `head_dim=64` | KV cache is the on-device constraint; 4:1 is the Qwen/Llama consensus |
+| hybrid attention | 3 gated-DeltaNet-or-SWA(1024) : 1 full | §5.2 |
+| attention sinks | learnable per-head key with a zero value | StreamingLLM / GPT-OSS. Implemented as a prepended K/V pair so it composes with SDPA instead of needing a hand-written softmax |
 | QK-norm | RMSNorm on q and k | Gemma 3/4; bounds attention logits, which matters more in 4-bit; avoids soft-capping's ~15% throughput cost |
+| pp-RoPE | rotate 25% of head dims on global layers; θ 10k local / 1M global | Gemma 4's `p=0.25` split-base scheme. Mellum2's single θ=500k is the alternative for a code-only model |
 | norms | pre + post RMSNorm per sublayer | Gemma 4; stabilises the residual stream that FP4 rounding perturbs |
-| attention pattern | 3 SWA(1024) : 1 global | Gemma 4's 4:1–5:1 |
-| RoPE | 10k local / 1M global | Gemma 4 split-base; context extension later touches only the global base |
-| activation | SwiGLU, no biases | unchanged from the predecessor; still standard |
-| embeddings | tied | ~10% of parameters returned to depth at 65k×2048 |
-| logits | FP32 + **z-loss 1e-4** | keeps `logsumexp` bounded; supersedes the predecessor's chunked-logit workaround |
+| MoE | top-2 of 8 routed + 1 shared expert, aux-loss-free bias balancing | DeepSeek-V3 bias nudging; Qwen3 / Gemma 4 26B-A4B shared-expert shape. Off at 12 GB — MoE buys FLOPs with memory, and memory is what is missing |
+| MTP | 1 extra block predicting `t+2`, weight 0.3 | DeepSeek-V3. Data efficiency, plus free speculative decoding |
+| intra-doc masking | no attention across `<\|eos\|>` inside a packed sequence | packing without it teaches cross-document dependence that does not exist |
+| activation / bias / tying | SwiGLU, no biases, tied embeddings | universal in 2026 dense stacks |
+| logits | FP32 + **z-loss 1e-4** | keeps `logsumexp` bounded; also removes the predecessor's chunked-logit workaround |
 | init | trunc-normal `d_model^-0.5`, residual projections ÷ `sqrt(2·n_layers)` | GPT-NeoX/OLMo depth scaling |
+| master weights | FP32, compute in BF16/FP4 | repairs the bf16-master defect measured in `aletheia-lm/config.py` (§1) |
+| EMA | optional (`ema_decay`) | cheap final-checkpoint gain; costs one FP32 copy |
+
+**Declined deliberately**, because "everything SOTA" also means not stacking components that fight:
+
+* **Full sparse attention (InfLLM-v2 / MiniCPM-SALA)** — its win appears at ≥128k context; this model
+  trains at 2048 and extends in the anneal.
+* **Mamba-2 / SSM blocks** — gated DeltaNet already occupies the efficient slot, and TE's FP4 path
+  covers `Linear`, not scan kernels.
+* **Hyper-connections / value-residual variants** — each changes the residual scale, invalidating the
+  depth-scaled init the 4-bit run depends on.
+* **MLA (latent KV)** — a genuine KV win, but its interaction with partial RoPE is unpublished at
+  this scale.
+* **Distillation** — the strongest single quality lever at ~300M, and explicitly out of scope: this
+  model is not derived from any other model.
 
 ---
 
@@ -353,12 +443,22 @@ intended to be deployed, because inference cost scales with parameter count and 
 improving well past the compute-optimal point. *Test-Time Scaling Makes Overtraining Compute-Optimal*
 (arXiv:2604.01411) makes the formal version of the argument.
 
-**Mapped to:** `tokens_per_param = 13_000`, applied to **non-embedding** parameters, with
-`TOTAL_STEPS` derived rather than set. The `laptop` preset drops it to 400 so a smoke run terminates;
-nothing else changes.
+**Mapped to, honestly.** `tokens_per_param = 13_000` is kept as the *aspiration*, and the config cell
+prints what it would actually cost: at ~271M non-embedding parameters that is ~3.5T tokens, i.e.
+GPU-years on an RTX 5070. So the run is sized by **wall clock** (`train_days`, default 14) and the
+cell reports the tok/param that budget really buys, next to the 13,000 target. The ratio is reachable
+on the `cluster` preset and is not reachable here; the notebook says which one you are in.
 
-Consequence for a domain model: 13k tok/param over a repository of a few megabytes *is* multi-epoch
-repetition. That is why `aletheia_epochs=24` is a feature rather than an accident.
+Two further constraints that any 13k-tok/param plan has to satisfy and that are easy to miss:
+
+* **It is a data problem before it is a compute problem.** LFM2.5 spent ~34T *unique* tokens. Looping
+  a 17B-token corpus 200× instead does not get you there: repetition decay (arXiv:2305.16264,
+  R\*_D ≈ 15) says the returns collapse long before that. Reaching 13k tok/param means streaming
+  Nemotron-CC/FineWeb-Edu/DCLM at trillion-token scale, which is why the data cell streams the Hub
+  rather than reading a local corpus.
+* **Domain knowledge is the exception.** The Aletheia OS repo is a few megabytes, so `aletheia_epochs
+  = 24` is deliberate repetition of a tiny, high-value slice — a different regime from the bulk mix,
+  and the one place where re-reading is the point.
 
 ---
 
@@ -465,6 +565,7 @@ Tokenizer:
 - Boundless Byte Pair Encoding — https://arxiv.org/pdf/2504.00178
 - Faster Superword Tokenization — https://arxiv.org/pdf/2604.05192
 - Getting the most out of your tokenizer — https://arxiv.org/html/2402.01035v2
+- Scaling Laws with Vocabulary — https://arxiv.org/abs/2407.13623
 
 Architecture:
 
@@ -476,6 +577,7 @@ Architecture:
 - Nemotron-Flash — https://arxiv.org/pdf/2511.18890
 - Nemotron-H — https://arxiv.org/pdf/2504.03624
 - Nemotron 3 Ultra — https://arxiv.org/pdf/2606.15007
+- Mellum2 (3:1 SWA, theta=500k, Muon for a code model) — https://arxiv.org/abs/2605.31268
 - MiniCPM / MiniCPM-SALA — https://github.com/openbmb/minicpm
 - LFM2 Technical Report — https://arxiv.org/html/2511.23404v1
 - LFM2.5-2.6B — https://www.liquid.ai/blog/lfm2-5-2-6b
@@ -505,5 +607,6 @@ Evaluation:
 Baseline repositories:
 
 - Aletheia OS — https://github.com/hotocoo/aletheia
+- aletheia-lm (private; the code model, source of the tokenizer sweep in §1) — https://github.com/hotocoo/aletheia-lm
 - aletheia1Bmx (MLX predecessor) — https://github.com/hotocoo/aletheia1Bmx
 - aletheiatokenizer (64k unigram predecessor) — https://github.com/hotocoo/aletheiatokenizer
