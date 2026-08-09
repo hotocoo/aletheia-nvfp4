@@ -36,7 +36,10 @@ fi
 if command -v systemd-run >/dev/null 2>&1 && systemctl is-system-running --quiet 2>/dev/null \
    || command -v systemd-run >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     systemctl reset-failed "$UNIT" 2>/dev/null || true
-    systemd-run --unit="$UNIT" --collect --same-dir \
+    # No --collect: when the run ends, the unit has to stay around long enough to read
+    # `systemctl show -p Result,ExecMainStatus` off it. A garbage-collected unit takes its
+    # exit status with it and leaves you guessing.
+    systemd-run --unit="$UNIT" --same-dir \
         --property=Type=simple \
         --property=KillMode=mixed \
         --property=TimeoutStopSec=120 \

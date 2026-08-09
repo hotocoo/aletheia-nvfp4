@@ -21,11 +21,23 @@ $PY   = "/opt/ale/bin/python"
 memory=12GB
 processors=8
 swap=8GB
+vmIdleTimeout=2147483647
 ```
 
 Without a cap, WSL2 takes about half the host RAM and never gives the Linux page cache back.
-That plus anything running natively is what froze this machine. If you edit it, apply with
-`wsl --shutdown` (which kills any running training — check first).
+That plus anything running natively is what froze this machine.
+
+`vmIdleTimeout` matters just as much and is much less obvious. WSL2 tears the **whole utility VM**
+down 60 seconds after the last `wsl.exe` session exits, taking the distro with it. The value is in
+milliseconds; `2147483647` is about 24 days.
+
+This is necessary but **not sufficient** to keep a run alive — see §3. It stops the VM from
+disappearing; it does nothing about WSL reaping the processes inside it.
+
+Both settings are read when the utility VM boots. `wsl --terminate Ubuntu` restarts the distro but
+**not** the VM, so it does not apply them — use `wsl --shutdown`, or leave WSL untouched for a
+couple of minutes and let the VM idle out on its own. Either way, check that nothing is training
+first.
 
 ---
 
@@ -124,29 +136,37 @@ raise `grad_accum` to 16: identical tokens per step, half the activation memory.
 ## 3. Start the run
 
 ```powershell
-wsl -d Ubuntu -u root -- bash $REPO/tools/wsl_pretrain_bg.sh
+powershell -ExecutionPolicy Bypass -File tools\start_run.ps1
 ```
 
-What it does: copies the notebook to `/root/aletheia-run` (ext4 — shard reads over `/mnt/c` go
-through the 9p bridge and cost more than the GPU does), picks up your Hugging Face token from the
-Windows-side cache if WSL has none, and runs the whole notebook under papermill — as a systemd
-transient unit named `aletheia-pretrain`, so the run belongs to PID 1 inside the VM rather than to
-the console you started it from.
+That script does two things, and **both are required**. Skipping either loses the run.
 
-**Launch it this way and not any other way.** Two launch styles look like they should work and
-both lose the run:
+**1. It opens a keep-alive session.** WSL kills the process tree belonging to a non-interactive
+`wsl -- ...` invocation once that invocation returns — about 8 seconds later. There is no signal in
+the journal, no exit status, and no distro reboot; the log simply stops. It reaches inside a
+systemd transient unit, so no unit property saves you: `Restart=` cannot restart what was reaped
+along with everything else. Measured over five launches: every session-less start died at
+launch+8 s at the identical log line, while a start made from a console that stayed open ran for
+an hour and stopped only when the WSL service itself glitched. The keep-alive is a single idle
+`wsl -d Ubuntu -u root -- sleep infinity` in a hidden window — it holds the session and does
+nothing else.
 
-- `Start-Process powershell ... -WindowStyle Hidden` ties the run's lifetime to a `wsl.exe` session
-  on the Windows side. The WSL service can get into a state where it answers
-  `Wsl/Service/E_UNEXPECTED` for every new session while the distro itself is still up; the hidden
-  launcher dies with it and papermill goes down mid-stage.
-- `setsid nohup ... &` inside a `wsl -- ...` invocation does not survive either. WSL reaps the
-  process tree of a non-interactive session when it exits, so the child is gone seconds after the
-  command returns.
+**2. It launches the run through `wsl_pretrain_bg.sh`,** which copies the notebook to
+`/root/aletheia-run` (ext4 — shard reads over `/mnt/c` go through the 9p bridge and cost more than
+the GPU does), picks up your Hugging Face token from the Windows-side cache if WSL has none, and
+starts papermill as the systemd transient unit `aletheia-pretrain`. systemd is what detaches the
+run from the console you typed in and gives it journald logging; it is not what keeps it alive.
 
-`wsl_pretrain_bg.sh` handles both: it refuses to start a second copy, and falls back to `setsid`
-only on a distro without systemd. `wsl_pretrain.sh` still runs the notebook in the foreground if
-you want to watch it directly in one console.
+Both scripts refuse to start a second copy. `wsl_pretrain.sh` still runs the notebook in the
+foreground if you would rather watch it in one console — that console is then your keep-alive, and
+closing it ends the run.
+
+If you prefer to do it by hand:
+
+```powershell
+Start-Process wsl -ArgumentList '-d','Ubuntu','-u','root','--','sleep','infinity' -WindowStyle Hidden
+wsl -d Ubuntu -u root -- bash $REPO/tools/wsl_pretrain_bg.sh
+```
 
 Once it is up:
 
@@ -254,6 +274,13 @@ The tokenizer and shard stages both cache. A second run skips straight to traini
 
 ## 6. Stopping and resuming
 
+```powershell
+wsl -d Ubuntu -u root -- systemctl stop aletheia-pretrain
+Get-CimInstance Win32_Process -Filter "Name='wsl.exe'" |
+  Where-Object CommandLine -like '*sleep*infinity*' |
+  ForEach-Object { Stop-Process -Id $_.ProcessId }        # release the keep-alive too
+```
+
 Stop it however you like — Ctrl-C, closing the window, a reboot. Checkpoints land every 200 steps
 and carry model weights, both optimizer states, the FP32 master weights, the EMA shadow and the RNG
 state, so a resume continues rather than restarts.
@@ -308,4 +335,8 @@ Knobs worth knowing, all in the config cell:
 | Whole machine freezes | WSL2 uncapped, or two heavy jobs at once | check `.wslconfig`; never build and train simultaneously |
 | Checkpoint stale >1 h | run died | read the log for the traceback, then relaunch — it resumes |
 | `Wsl/Service/E_UNEXPECTED` on every `wsl` command, distro still listed as running | WSL session state corrupted — often a `tail -f` relay held open for a long time | the VM recycles on its own; wait, then relaunch with `wsl_pretrain_bg.sh` and watch via `\\wsl.localhost` instead |
-| Run vanishes shortly after launch, empty launcher log | backgrounded inside a `wsl -- ...` session, which WSL reaps on exit | launch with `wsl_pretrain_bg.sh` (systemd unit), not `setsid`/`Start-Process` |
+| Run dies ~8 s after launch, unit gone, no journal entry, no exit status, log stops mid-stage | WSL reaped the session's process tree — reaches into systemd units too | launch with `start_run.ps1`, which holds a keep-alive session (§3) |
+| Run dies ~60 s after launch and `journalctl --list-boots` shows a fresh boot | WSL2 shut the utility VM down on its idle timer | set `vmIdleTimeout=2147483647` in `.wslconfig` (§0) and let the VM recycle so it takes effect |
+| A run appears to die at the same log line every time | that line is simply where ~8 s of runtime lands; the next source resolves over the network in silence | not a data-source bug — check for the reaping above before touching the mixture |
+| `uptime` shows hours but the run is gone anyway | `uptime` reads the VM kernel's clock, not the distro's — it does not reset when the distro restarts | use `journalctl --list-boots` to tell whether the distro actually restarted |
+| `pgrep -c papermill` returns 0 while the run is healthy | papermill runs as `python -m papermill`, so the process *name* is `python` | match the full command line: `pgrep -af papermill` |

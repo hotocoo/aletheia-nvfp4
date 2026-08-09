@@ -30,6 +30,14 @@ echo "log      : $WORK/logs/pretrain.log"
 echo "status   : $VENV/bin/python $REPO/tools/train_status.py $WORK/aletheia_nvfp4"
 echo
 
+# PIPESTATUS, not $?, or you record tee's exit status instead of papermill's. A run that ends
+# without this line in the log was killed outright rather than failing -- the distinction matters,
+# because a kill points at the platform (WSL session teardown, OOM) and a non-zero exit points at
+# the notebook.
+set +e
 "$VENV/bin/python" -m papermill \
     Aletheia_NVFP4_Pretrain.ipynb logs/pretrain_out.ipynb \
     --log-output --no-progress-bar 2>&1 | tee -a logs/pretrain.log
+rc=${PIPESTATUS[0]}
+printf '[exit] papermill rc=%s at %s\n' "$rc" "$(date -Is)" | tee -a logs/pretrain.log
+exit "$rc"
