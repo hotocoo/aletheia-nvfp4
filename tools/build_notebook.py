@@ -76,9 +76,13 @@ CUDA BF16 port of the MLX trainer.
 md(r"""
 ## 1. Environment
 
-Latest releases as of 2026-08-08 (Linux / WSL2; CUDA 13.0 is the PyPI default, CUDA 13.2 —
-`.../whl/nightly/cu132` — carries the widest Blackwell support; for source builds on RTX 50-series
-include `12.0 12.1` in `TORCH_CUDA_ARCH_LIST`):
+Two supported paths. Only the first reaches FP4 — `transformer_engine` has no native-Windows build,
+so on Windows the capability probe below falls through to BF16 and every NVFP4 cell degrades to a
+documented no-op.
+
+**Linux / WSL2 — the FP4 path.** Latest releases as of 2026-08-08 (CUDA 13.0 is the PyPI default,
+CUDA 13.2 — `.../whl/nightly/cu132` — carries the widest Blackwell support; for source builds on
+RTX 50-series include `12.0 12.1` in `TORCH_CUDA_ARCH_LIST`):
 
 ```bash
 pip install --upgrade "torch>=2.13.0" --index-url https://download.pytorch.org/whl/cu130
@@ -89,8 +93,31 @@ pip install "tokenizers>=0.23.1" "transformers>=5.14.1" "datasets>=5.0.1" "safet
 pip install flash-linear-attention lm-eval tiktoken sentencepiece
 ```
 
+**Native Windows — the BF16 path.** Verified end to end on Windows 11 / Python 3.11 / RTX 5070
+(`sm_120`, 12 GB) with torch 2.7.1+cu128, transformers 4.55, tokenizers 0.21, datasets 4.0. A CUDA
+build is mandatory: the default PyPI `torch` wheel is CPU-only and `torch.cuda.is_available()`
+returns False.
+
+```bash
+pip install "torch==2.7.1+cu128" --index-url https://download.pytorch.org/whl/cu128
+pip install tokenizers transformers datasets safetensors numpy matplotlib tqdm zstandard ipywidgets
+pip install papermill ipykernel            # headless execution
+```
+
+Two Windows-specific consequences, both handled automatically by the config cell:
+
+* **No FP4/FP8.** `PRECISION_PATH` resolves to `bf16`; the recipe A/B cell then reports a single row
+  instead of a comparison, and the ablation grid stays off.
+* **No `torch.compile`.** Inductor needs Triton, which has no native-Windows backend, and
+  `torch.compile()` fails lazily *inside the first forward pass* — past the `try/except` that wraps
+  the compile call. `cfg.compile` is therefore forced to `False` on Windows.
+
 Older stacks also work: the notebook falls back from TE's `autocast` to the deprecated
 `fp8_autocast`, and to a bundled Newton–Schulz Muon when `torch.optim.Muon` is absent (< 2.9).
+
+**Hugging Face access.** The strongest corpora in the mixture are gated. Run
+`huggingface-cli login`, then click *Agree and access repository* on each dataset page listed in §4.
+Every corpus is **streamed** — only the encoded `uint16` shards touch the disk.
 """)
 
 code(r"""
@@ -206,6 +233,9 @@ class Cfg:
     z_loss: float = 1e-4             # keeps the softmax denominator near 1
     # --- the August-2026 SOTA stack, each independently switchable ---------
     hybrid_linear: bool = True       # gated DeltaNet in the non-global slots when `fla` is present
+                                     # NOTE: its recurrent state runs the full packed sequence and
+                                     # is not reset at document boundaries -- `intra_doc_mask`
+                                     # applies to the attention layers only.
     attn_sinks: bool = True          # learnable per-head sink logit (StreamingLLM / GPT-OSS)
     partial_rope: float = 0.25       # Gemma 4 pp-RoPE: rotate this fraction of dims on global layers
     intra_doc_mask: bool = True      # never attend across a document boundary inside a packed seq
@@ -223,8 +253,11 @@ class Cfg:
     micro_batch: int = 2
     grad_accum: int = 8
     aletheia_epochs: int = 24        # the OS repo is tiny: upsample it hard
+    # Slot names are mixture roles, not repo names -- each resolves through a candidate chain
+    # in `SOURCES` (cell 3a). `web_hq` is a cross-deduplicated union (Zyda-2), which is why
+    # there is no longer a separate DCLM slot to de-correlate against it by hand.
     mix: dict = field(default_factory=lambda: {
-        "nemotron_cc_hq": 0.34, "fineweb_edu": 0.20, "dclm": 0.08,
+        "web_hq": 0.34, "synthetic_edu": 0.18, "curated": 0.10,
         "chat": 0.14, "code": 0.11, "math": 0.05, "aletheia": 0.08,
     })
 
@@ -276,6 +309,22 @@ elif PRESET == "cluster":               # multi-node B200
 
 if cfg.precision == "auto":
     cfg.precision = PRECISION_PATH
+
+# FP4 stochastic rounding is a datacenter-Blackwell instruction. Transformer Engine gates it on
+#   ARCH_HAS_STOCHASTIC_ROUNDING = NVTE_CUDA_ARCH_MATCHES(ArchSpecific<100>, ArchSpecific<103>)
+# so sm_100a/sm_103a (B200/B300) have it and sm_120a (RTX 50, RTX PRO 6000) does not -- no build
+# flag adds it. Left on, every quantized backward pass prints a per-thread device error and the
+# gradient cast silently falls back. The rest of the recipe (RHT, 2D weight scaling) is unaffected.
+if cfg.nvfp4_stochastic_rounding and SM in (120, 121):
+    cfg.nvfp4_stochastic_rounding = False
+    print(f"[!] sm_{SM}: FP4 stochastic rounding unavailable on consumer Blackwell -> disabled")
+
+# torch.compile needs the Triton/inductor backend, which has no native-Windows build.
+# `torch.compile()` itself returns lazily -- the failure lands inside the first forward pass,
+# outside the try/except in the training cell -- so the switch has to be flipped here.
+if platform.system() == "Windows" and cfg.compile:
+    cfg.compile = False
+    print("[!] native Windows: torch.compile disabled (no Triton/inductor backend)")
 
 D_FF = cfg.d_ff
 for d in (cfg.d_model, D_FF, cfg.vocab_size, cfg.n_heads * cfg.head_dim,
@@ -389,6 +438,122 @@ DOC_EXT = {".md", ".rst", ".txt", ".adoc"}
 SPECIAL_NAMES = {"Makefile", "Kconfig", "CMakeLists.txt", "Cargo.toml", "Cargo.lock", "justfile"}
 SKIP_DIRS = {".git", "target", "build", "dist", "out", "node_modules", ".cache", ".venv"}
 
+# ---- streaming source registry ---------------------------------------------------
+# Every corpus is *streamed*, never downloaded: only the encoded uint16 shards land on disk.
+# Each slot is an ordered candidate list -- the first source that authenticates AND actually
+# yields text wins. Later entries are documented quality fallbacks, not equals.
+#
+# The mixture is built entirely from **ungated** corpora. The gated Aug-2026 sets
+# (Nemotron-CC-v2, starcoderdata, Nemotron-Pretraining-Code-v1) are kept as the *first*
+# candidate of their slot, so an account that holds the grant uses them automatically and one
+# that does not degrades to an ungated equivalent with an explicit printed line -- rather than
+# the run silently dropping a third of its tokens.
+#
+# Spec tuple: (repo_id, config, split_or_splits, text_field). `config="*"` interleaves every
+# config of the repo; a list of splits is interleaved likewise.
+SOURCES = {
+    # Filtered web. Zyda-2 is FineWeb-Edu3 + DCLM + Zyda-1 + Dolma-CC *cross-deduplicated*
+    # (arXiv:2411.15242) -- it is the de-correlated union this mixture used to assemble by hand
+    # out of three separate slots, done properly and with the overlap removed.
+    "web_hq": [
+        ("nvidia/Nemotron-CC-v2", None, "train", "text"),
+        ("Zyphra/Zyda-2", "sample-100BT", "train", "text"),
+        ("HuggingFaceFW/fineweb-edu", "sample-350BT", "train", "text"),
+    ],
+    # Synthetic rephrasing is the axis Nemotron-CC-HQ's +5.6 MMLU is credited to
+    # (arXiv:2412.02595). Cosmopedia-v2 is the open instance of it: 28B tokens of textbook-style
+    # rewrites, ungated.
+    "synthetic_edu": [
+        ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", "train", "text"),
+        ("HuggingFaceTB/smollm-corpus", "fineweb-edu-dedup", "train", "text"),
+    ],
+    # OLMo 2's mid-training mix: curated web + reference + STEM, quality-weighted.
+    "curated": [
+        ("allenai/dolmino-mix-1124", None, "train", "text"),
+        ("mlfoundations/dclm-baseline-1.0-parquet", None, "train", "text"),
+    ],
+    # the-stack-v2 is deliberately NOT here: its rows carry Software Heritage blob ids, not
+    # source text -- the contents need a separate S3 fetch with AWS credentials, so a
+    # `row["content"]` pipeline reads it as an infinite run of empty rows.
+    # starcoder2data-*extras* is likewise not code (arxiv / issues / wikipedia configs).
+    # OpenCoder's annealing corpus is the ungated stand-in: real source across its three
+    # configs (synthetic snippets, synthetic QA, algorithmic corpus), interleaved.
+    "code": [
+        ("bigcode/starcoderdata", "*", "train", "content"),
+        ("OpenCoder-LLM/opc-annealing-corpus", "*", "train", "text"),
+        ("nvidia/OpenCodeInstruct", None, "train", "output"),
+        ("codeparrot/codeparrot-clean", None, "train", "content"),
+    ],
+    # FineMath-4plus is the higher-precision successor to OpenWebMath on the same crawl.
+    "math": [
+        ("HuggingFaceTB/finemath", "finemath-4plus", "train", "text"),
+        ("open-web-math/open-web-math", None, "train", "text"),
+    ],
+}
+
+EMPTY_ROW_LIMIT = 500     # a source whose text field is absent would otherwise spin forever
+CONFIG_CAP = 16           # how many configs of a multi-config corpus to interleave
+
+
+def _configs(repo_id: str, config):
+    '''`"*"` means every config of the repo (a language list, typically), interleaved.
+
+    Taking configs[0] instead would quietly train on one language, so the wildcard fans out.
+    '''
+    if config != "*":
+        return [config]
+    from datasets import get_dataset_config_names
+    names = get_dataset_config_names(repo_id)
+    return names[:CONFIG_CAP] or [None]
+
+
+def _open_stream(repo_id, config, split, field):
+    '''Return an iterator of rows, or raise. Fans out over configs and splits, interleaved.'''
+    from datasets import load_dataset, interleave_datasets
+    splits = list(split) if isinstance(split, (list, tuple)) else [split]
+    parts = [load_dataset(repo_id, c, split=s, streaming=True)
+             for c in _configs(repo_id, config) for s in splits]
+    if len(parts) == 1:
+        return parts[0]
+    return interleave_datasets(parts, stopping_strategy="all_exhausted")
+
+
+def stream_texts(slot: str, specs=None, to_text=None):
+    '''Yield text strings for a mixture slot, walking the candidate chain on failure.
+
+    A candidate is abandoned when it cannot be opened (gated / missing) or when it produces
+    EMPTY_ROW_LIMIT consecutive rows with no usable text -- the failure mode that turns a
+    silent mixture shift into an unbounded scan of a billion-row dataset.
+    '''
+    specs = specs if specs is not None else SOURCES[slot]
+    for repo_id, config, split, field in specs:
+        try:
+            ds = _open_stream(repo_id, config, split, field)
+        except Exception as exc:
+            print(f"[!] {slot}: {repo_id} unavailable ({type(exc).__name__}) -> next candidate")
+            continue
+        empties, produced = 0, 0
+        try:
+            for row in ds:
+                txt = to_text(row) if to_text is not None else row.get(field)
+                if not txt:
+                    empties += 1
+                    if produced == 0 and empties >= EMPTY_ROW_LIMIT:
+                        print(f"[!] {slot}: {repo_id} field '{field}' empty after "
+                              f"{empties} rows -> next candidate")
+                        break
+                    continue
+                empties = 0
+                produced += 1
+                yield txt
+        except Exception as exc:
+            print(f"[!] {slot}: {repo_id} stream error {type(exc).__name__}: {exc}")
+        if produced:
+            print(f"[=] {slot}: source = {repo_id}")
+            return
+    print(f"[!] {slot}: no usable source -- this slot contributes nothing")
+
+
 def clone_aletheia() -> Path:
     if ALETHEIA_DIR.exists():
         return ALETHEIA_DIR
@@ -415,7 +580,8 @@ def build_tokenizer_corpus(target_gb: float) -> Path:
     budget = int(target_gb * 1e9)
     # Aletheia OS gets an outsized share of the tokenizer corpus on purpose: its identifiers
     # (`CapabilityRef`, `ContextFabric`, `IntentEnvelope`) must be single tokens.
-    quota = {"aletheia": 0.12, "prose": 0.58, "code": 0.22, "math": 0.08}
+    quota = {"aletheia": 0.12, "web_hq": 0.40, "synthetic_edu": 0.18,
+             "code": 0.22, "math": 0.08}
     written = {k: 0 for k in quota}
     t0 = time.time()
     with open(CORPUS, "w", encoding="utf-8") as out:
@@ -432,35 +598,17 @@ def build_tokenizer_corpus(target_gb: float) -> Path:
         print(f"[+] aletheia: {written['aletheia']/1e6:.1f} MB")
 
         try:
-            from datasets import load_dataset
-            streams = {
-                "prose": [
-                    ("nvidia/Nemotron-CC-v2", None, "text"),
-                    ("HuggingFaceFW/fineweb-edu", "sample-10BT", "text"),
-                ],
-                "code": [("bigcode/the-stack-v2-dedup", None, "content")],
-                "math": [("open-web-math/open-web-math", None, "text")],
-            }
-            for group, specs in streams.items():
-                cap = quota[group] * budget
-                for repo_id, sub, field in specs:
-                    if written[group] >= cap:
-                        break
-                    try:
-                        ds = load_dataset(repo_id, sub, split="train", streaming=True)
-                    except Exception as exc:
-                        print(f"[!] {repo_id}: {type(exc).__name__} -> skipped")
-                        continue
-                    for row in ds:
-                        txt = row.get(field) or ""
-                        if not txt:
-                            continue
-                        out.write(txt + "\n\n"); written[group] += len(txt) + 2
-                        if written[group] >= cap:
-                            break
-                print(f"[+] {group}: {written[group]/1e6:.1f} MB")
+            import datasets  # noqa: F401
         except ImportError:
             print("[!] `datasets` missing - tokenizer corpus is Aletheia-only (fine for a smoke run)")
+        else:
+            for group in ("web_hq", "synthetic_edu", "code", "math"):
+                cap = quota[group] * budget
+                for txt in stream_texts(group):
+                    out.write(txt + "\n\n"); written[group] += len(txt) + 2
+                    if written[group] >= cap:
+                        break
+                print(f"[+] {group}: {written[group]/1e6:.1f} MB")
     print(f"[=] corpus {CORPUS.stat().st_size/1e9:.2f} GB in {time.time()-t0:.0f}s")
     return CORPUS
 
@@ -668,8 +816,18 @@ def assemble_final(stage1: Tokenizer, merges, id2tok) -> Tokenizer:
 stage1 = train_stage1(CORPUS, T_MERGES)
 sw_merges, id2tok = learn_superword_merges(stage1, CORPUS, cfg.vocab_size - T_MERGES)
 tokenizer = assemble_final(stage1, sw_merges, id2tok)
-VOCAB_SIZE_ACTUAL = tokenizer.get_vocab_size()
-print(f"[=] final vocab {VOCAB_SIZE_ACTUAL} (target {cfg.vocab_size})")
+# `get_vocab_size()` counts distinct *pieces*, which is not the width of the id space: stage 2
+# can mint two merges whose byte-level strings coincide, so the vocabulary ends up with a few
+# unused ids and max(id) + 1 > len(vocab). Sizing the embedding by the count leaves the top ids
+# unmapped, and an id the tokenizer really emits then indexes past the embedding -- which CUDA
+# reports as a device-side assert inside the first backward pass, several kernels away from the
+# cause. Size by the id space instead, rounded up to a multiple of 128 for GEMM alignment.
+_VOCAB_IDS = tokenizer.get_vocab(with_added_tokens=True).values()
+_ID_SPACE = max(_VOCAB_IDS) + 1
+VOCAB_SIZE_ACTUAL = -(-_ID_SPACE // 128) * 128
+print(f"[=] final vocab {tokenizer.get_vocab_size()} distinct pieces over an id space of "
+      f"{_ID_SPACE} ({_ID_SPACE - tokenizer.get_vocab_size()} unused)")
+print(f"[=] embedding rows {VOCAB_SIZE_ACTUAL} (target {cfg.vocab_size}, 128-aligned)")
 """)
 
 code(r"""
@@ -738,7 +896,8 @@ def bench(name, encode):
     return name, rows
 
 encoders = [
-    ("SuperBPE 65k (ours)", lambda t: tokenizer.encode(t, add_special_tokens=False).ids),
+    (f"SuperBPE {VOCAB_SIZE_ACTUAL//1024}k (ours)",
+     lambda t: tokenizer.encode(t, add_special_tokens=False).ids),
     ("stage-1 BPE (no superwords)", lambda t: stage1.encode(t, add_special_tokens=False).ids),
 ]
 v3_json = cfg.lm_repo / "test" / "aletheia_tok_v3" / "tokenizer.json"
@@ -781,18 +940,69 @@ md(r"""
 
 Mixture rationale (Aug 2026):
 
-* **Nemotron-CC-HQ** (arXiv:2412.02595) — classifier-ensemble + synthetic rephrasing; +5.6 MMLU over
-  DCLM at 8B/1T, and 4× more unique real tokens than DCLM at full size. Largest single share.
-* **FineWeb-Edu** + **DCLM** — different filters, so their union de-correlates filter bias
-  (the Zyda-2 argument).
+* **`web_hq` — Zyda-2** (arXiv:2411.15242): FineWeb-Edu3 + DCLM + Zyda-1 + Dolma-CC, **cross-
+  deduplicated**. The old mixture spent three separate slots assembling that union by hand and
+  still double-counted the overlap; Zyda-2 is the same de-correlation argument done properly.
+  Largest single share.
+* **`synthetic_edu` — Cosmopedia-v2**: 28B tokens of textbook-style synthetic rewrites. Synthetic
+  rephrasing is the axis Nemotron-CC-HQ's +5.6 MMLU over DCLM is credited to (arXiv:2412.02595);
+  this is the open instance of it.
+* **`curated` — Dolmino-mix-1124**: OLMo 2's mid-training mix, quality-weighted web + reference +
+  STEM.
 * **code + math** — the target model reads and writes Rust/C/asm about a kernel.
 * **Aletheia OS repo** — a few MB, upsampled `aletheia_epochs` times. This is the knowledge the model
   must actually hold, and repetition is precisely what the 13k tok/param regime licenses.
 * **chat** — a small share during pretraining so the chat special tokens are never cold at anneal.
 
+### Sources are candidate chains, not single repos
+
+Each mixture slot is an ordered list in `SOURCES` / `STREAM_SPECS`. The first entry that both
+authenticates *and* actually yields text wins; later entries are documented quality fallbacks, not
+equals. The run prints which source won every slot, and closes with a table of the mixture it
+*realised* against the mixture that was *requested* — a gated repo can no longer shift the blend
+behind a one-line warning.
+
+| slot | first choice | ungated default | further fallback |
+|---|---|---|---|
+| `web_hq` | `nvidia/Nemotron-CC-v2` *(gated)* | `Zyphra/Zyda-2` `sample-100BT` | `HuggingFaceFW/fineweb-edu` `sample-350BT` |
+| `synthetic_edu` | — | `HuggingFaceTB/smollm-corpus` `cosmopedia-v2` | `…/fineweb-edu-dedup` |
+| `curated` | — | `allenai/dolmino-mix-1124` | `mlfoundations/dclm-baseline-1.0-parquet` |
+| `code` | `bigcode/starcoderdata` *(gated)*, all languages | `OpenCoder-LLM/opc-annealing-corpus`, all 3 configs | `nvidia/OpenCodeInstruct`, then `codeparrot/codeparrot-clean` |
+| `math` | — | `HuggingFaceTB/finemath` `finemath-4plus` | `open-web-math/open-web-math` |
+| `chat` | — | `HuggingFaceTB/smoltalk2` `SFT`, **all 25 splits interleaved** | — |
+
+**No grant is required.** The mixture is built entirely from ungated corpora; the two gated sets
+sit first in their chains only so that an account holding
+[Nemotron-CC-v2](https://huggingface.co/datasets/nvidia/Nemotron-CC-v2) or
+[starcoderdata](https://huggingface.co/datasets/bigcode/starcoderdata) picks them up
+automatically. Without the grant the run prints one line per slot naming the source it used.
+
+Three traps this cell is written around, each of which silently corrupts the blend:
+
+1. **SmolTalk2 has no `train` split.** The `SFT` config is 25 named sub-corpora — reasoning traces,
+   tool-calling, multilingual, everyday chat. `split="train"` raises, the exception handler skips the
+   slot, and the chat share quietly becomes zero. Interleaving all 25 *is* the SmolTalk2 recipe; any
+   single split is a different, far narrower dataset.
+2. **The Stack v2 ships blob ids, not source.** Its rows point at Software Heritage; the contents
+   need a separate S3 fetch with AWS credentials. A `row["content"]` pipeline therefore reads it as
+   an unbounded run of empty rows — not an error, just a scan of a billion-row dataset that never
+   emits a token. `starcoder2data-extras` fails differently: its configs are arxiv / issues /
+   wikipedia, so it looks like it works while contributing no code at all. Both are excluded, with
+   the reasoning inline.
+3. **An empty text field is unbounded, not fatal.** `stream_texts` abandons a candidate after
+   `EMPTY_ROW_LIMIT` consecutive rows with no usable text and moves to the next one, so trap 2 costs
+   seconds rather than days no matter which repo hits it.
+
+Chat rows are rendered through `hf_tok.apply_chat_template`, with a manual `<|role|>` renderer as
+backstop for rows whose `content` is a list of parts rather than a string.
+
 Shards are flat `uint16` (vocab ≤ 65536), documents separated by `<|eos|>`, plus a `.idx` of document
 offsets so the loader can respect document boundaries. This is the same memmap-shard pattern as
-`aletheiaMLX.ipynb`, halved in size and with an index.
+`aletheiaMLX.ipynb`, halved in size and with an index. Nothing but the shards is written: every
+corpus above is consumed with `streaming=True`.
+
+`build_shards` reuses an existing `train_meta.json` — a shard set built for a short smoke run will be
+reused verbatim by a long one unless you pass `force=True`.
 """)
 
 code(r"""
@@ -859,13 +1069,29 @@ def aletheia_documents():
     return docs
 
 
+# SmolTalk2 ships no `train` split: the SFT config is 25 named sub-corpora (reasoning traces,
+# tool calling, multilingual, everyday chat). Interleaving all of them IS the SmolTalk2 recipe --
+# taking one split would be a different, much narrower dataset, and asking for "train" raises,
+# which would silently zero the chat share of the mixture.
+def smoltalk_splits(config: str = "SFT"):
+    try:
+        from datasets import get_dataset_split_names
+        return get_dataset_split_names("HuggingFaceTB/smoltalk2", config)
+    except Exception as exc:
+        print(f"[!] smoltalk2 split listing failed ({type(exc).__name__}); using a static subset")
+        return ["OpenHermes_2.5_no_think", "smoltalk_systemchats_Qwen3_32B_think",
+                "multi_turn_reasoning_if_think", "Mixture_of_Thoughts_science_no_think"]
+
+
+# Per-slot candidate chains. `SOURCES` (cell 3a) already covers prose/code/math; the mixture
+# keys below map onto it, and the two remaining slots are declared here.
 STREAM_SPECS = {
-    "nemotron_cc_hq": ("nvidia/Nemotron-CC-v2", None, "text"),
-    "fineweb_edu":    ("HuggingFaceFW/fineweb-edu", "sample-100BT", "text"),
-    "dclm":           ("mlfoundations/dclm-baseline-1.0-parquet", None, "text"),
-    "code":           ("bigcode/the-stack-v2-dedup", None, "content"),
-    "math":           ("open-web-math/open-web-math", None, "text"),
-    "chat":           ("HuggingFaceTB/smoltalk2", "SFT", None),
+    "web_hq":        SOURCES["web_hq"],
+    "synthetic_edu": SOURCES["synthetic_edu"],
+    "curated":       SOURCES["curated"],
+    "code":          SOURCES["code"],
+    "math":          SOURCES["math"],
+    "chat":          [("HuggingFaceTB/smoltalk2", "SFT", smoltalk_splits("SFT"), None)],
 }
 
 def chat_to_text(row):
@@ -873,15 +1099,27 @@ def chat_to_text(row):
     if not msgs:
         return None
     try:
-        return hf_tok.apply_chat_template(msgs, tokenize=False)
+        out = hf_tok.apply_chat_template(msgs, tokenize=False)
+        if out:
+            return out
     except Exception:
-        return None
+        pass
+    # Fallback: the template can reject rows whose `content` is a list of parts.
+    parts = []
+    for m in msgs:
+        c = m.get("content")
+        if isinstance(c, list):
+            c = "".join(p.get("text", "") for p in c if isinstance(p, dict))
+        if c:
+            parts.append(f"<|{m.get('role', 'user')}|>\n{c}")
+    return "\n".join(parts) or None
 
 
 def build_shards(target_tokens: int, val_tokens: int = 4_000_000, force: bool = False):
     meta_path = SHARDS / "train_meta.json"
     if meta_path.exists() and not force:
         print(f"[=] reuse shards: {json.loads(meta_path.read_text())}")
+        print("    (pass force=True to rebuild -- a smoke-run shard set is NOT a full-run one)")
         return
     for f in SHARDS.glob("*"):
         f.unlink()
@@ -907,26 +1145,20 @@ def build_shards(target_tokens: int, val_tokens: int = 4_000_000, force: bool = 
 
     # --- streamed corpora
     try:
-        from datasets import load_dataset
+        import datasets  # noqa: F401
     except ImportError:
         print("[!] `datasets` missing - training on Aletheia only")
         train.close(); val.close(); return
 
     from tqdm.auto import tqdm
+    realised = {}
     for key, quota in quotas.items():
         if key == "aletheia" or quota <= 0:
             continue
-        repo_id, sub, field = STREAM_SPECS[key]
-        try:
-            ds = load_dataset(repo_id, sub, split="train", streaming=True)
-        except Exception as exc:
-            print(f"[!] {repo_id}: {type(exc).__name__} -> skipped"); continue
         got, val_got = 0, 0
         bar = tqdm(total=quota, unit="tok", desc=key, dynamic_ncols=True)
-        for row in ds:
-            text = chat_to_text(row) if key == "chat" else row.get(field)
-            if not text:
-                continue
+        to_text = chat_to_text if key == "chat" else None
+        for text in stream_texts(key, STREAM_SPECS[key], to_text=to_text):
             ids = encode_doc(text)
             if val_got < val_tokens * cfg.mix[key]:
                 val.add(ids); val_got += len(ids)
@@ -935,7 +1167,20 @@ def build_shards(target_tokens: int, val_tokens: int = 4_000_000, force: bool = 
             if got >= quota:
                 break
         bar.close()
+        realised[key] = got
+        if got < 0.95 * quota:
+            print(f"[!] {key}: only {got/1e6:.0f}M of {quota/1e6:.0f}M tokens -- source exhausted "
+                  f"or unavailable; the mixture is skewed accordingly")
     train.close(); val.close()
+
+    # --- what the mixture actually turned out to be, vs what was asked for
+    tot = sum(realised.values()) or 1
+    print(f"\n{'slot':16s}{'target %':>10s}{'actual %':>10s}{'tokens':>14s}")
+    for key in cfg.mix:
+        if key == "aletheia":
+            continue
+        print(f"{key:16s}{cfg.mix[key]*100:9.1f}%{realised.get(key, 0)/tot*100:9.1f}%"
+              f"{realised.get(key, 0):14,}")
 
 build_shards(TOKEN_BUDGET)
 """)
@@ -1025,6 +1270,19 @@ def linear_factory(kind: str, layer_idx: int):
     return lambda i, o: nn.Linear(i, o, bias=False, dtype=BF16)
 
 
+# Activation checkpointing has to know about the quantizer. `torch.utils.checkpoint` recomputes
+# the block outside the FP4 autocast region, so the recomputed forward saves a different set of
+# tensors than the original did and autograd refuses the mismatch:
+#   "A different number of tensors was saved during the original forward and recomputation."
+# Transformer Engine's own checkpoint re-enters the quantization context on recompute, which is
+# exactly the missing piece. Fall back to torch's when running without TE.
+if TE is not None:
+    ACT_CKPT = lambda fn, *a: TE.checkpoint(fn, *a)                              # noqa: E731
+else:
+    ACT_CKPT = lambda fn, *a: torch.utils.checkpoint.checkpoint(                 # noqa: E731
+        fn, *a, use_reentrant=False)
+
+
 class RMSNorm(nn.Module):
     def __init__(self, d, eps=1e-5):
         super().__init__()
@@ -1037,26 +1295,91 @@ class RMSNorm(nn.Module):
         return (x.to(dt) * self.w)
 
 
+# ---- attention backend selection --------------------------------------------------------
+# The mask this model needs is a *composition*: causal AND sliding-window AND intra-document.
+# Handing SDPA an explicit boolean mask expresses that, but it also disqualifies the flash
+# backend -- SDPA falls back to the math/memory-efficient path, which materialises the full
+# (B, H, L, L) score matrix. FlexAttention expresses the same composition as a block mask and
+# keeps a fused kernel, skipping whole blocks that the mask zeroes out.
+#
+# It lowers through Triton, so native Windows has no backend for it. The manual path below is
+# the fallback, and is written to compute *exactly* the same function so the two agree.
+USE_FLEX = False
+if HAS_CUDA and platform.system() != "Windows":
+    try:
+        from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+        import triton                                          # noqa: F401  (backend check)
+        flex_attention = torch.compile(flex_attention, dynamic=False)
+        create_block_mask = torch.compile(create_block_mask, dynamic=False)
+        USE_FLEX = True
+    except Exception as _exc:
+        print(f"[!] FlexAttention unavailable ({type(_exc).__name__}); manual attention path")
+print(f"attention backend: {'FlexAttention (block mask)' if USE_FLEX else 'manual (chunked)'}")
+
+
 def build_masks(idx, device):
-    # One mask set per forward, shared by every layer. Combines: causal, sliding window,
-    # intra-document (never attend across <|eos|>), and a leading always-visible sink column.
+    # One mask set per forward, shared by every layer: (local, global). The sink is NOT a mask
+    # column -- it is a per-head logit added to the softmax denominator (see Attention), so both
+    # mask sets cover the real tokens only.
     B, L = idx.shape
-    i = torch.arange(L, device=device)
-    causal = i[:, None] >= i[None, :]
-    local = causal & ((i[:, None] - i[None, :]) < cfg.window)
+    doc = None
     if cfg.intra_doc_mask:
         doc = (idx == EOS_ID).cumsum(-1)                       # document id per position
         doc = doc - (idx == EOS_ID).long()                     # the EOS itself ends its own doc
+
+    if USE_FLEX:
+        # These closures are redefined every call, but Dynamo keys its cache on the code object,
+        # not the closure instance, so this compiles once and then reuses the kernel.
+        def global_mod(b, h, q, kv):
+            m = q >= kv
+            return m if doc is None else (m & (doc[b, q] == doc[b, kv]))
+
+        def local_mod(b, h, q, kv):
+            return global_mod(b, h, q, kv) & ((q - kv) < cfg.window)
+
+        return (create_block_mask(local_mod, B, None, L, L, device=device),
+                create_block_mask(global_mod, B, None, L, L, device=device))
+
+    i = torch.arange(L, device=device)
+    causal = i[:, None] >= i[None, :]
+    local = causal & ((i[:, None] - i[None, :]) < cfg.window)
+    if doc is not None:
         same = doc[:, :, None] == doc[:, None, :]              # (B, L, L)
-        causal = causal[None] & same
-        local = local[None] & same
+        causal, local = causal[None] & same, local[None] & same
     else:
         causal, local = causal[None].expand(B, L, L), local[None].expand(B, L, L)
-    if cfg.attn_sinks:                                          # sink column is always visible
-        ones = torch.ones(B, L, 1, dtype=torch.bool, device=device)
-        causal = torch.cat([ones, causal], -1)
-        local = torch.cat([ones, local], -1)
-    return causal[:, None], local[:, None]                      # (B, 1, L, L(+1))
+    return local[:, None], causal[:, None]                     # (B, 1, L, L)
+
+
+def manual_attention(q, k, v, keep, sink, chunk: int = 512):
+    # Reference attention with an attention-sink logit, used by the Windows fallback and by
+    # incremental decoding. Scores are accumulated in FP32 and chunked over queries so the
+    # score matrix never exists in full.
+    #
+    # `sink` is a per-head logit appended to the softmax denominator with an implicit zero
+    # value vector: softmax mass that belongs to no real token lands there instead of being
+    # forced onto whatever the window happens to still hold. This is the same function
+    # FlexAttention's `out * sigmoid(lse - sink)` computes -- keep the two in step.
+    B, H, L, D = q.shape
+    if k.shape[1] != H:                                        # GQA: expand kv heads
+        rep = H // k.shape[1]
+        k, v = k.repeat_interleave(rep, 1), v.repeat_interleave(rep, 1)
+    scale = D ** -0.5
+    parts = []
+    step = min(chunk, L)
+    for s in range(0, L, step):
+        e = min(s + step, L)
+        sc = (q[:, :, s:e].float() @ k.transpose(-1, -2).float()) * scale
+        if keep is not None:
+            sc = sc.masked_fill(~keep[:, :, s:e], float("-inf"))
+        mx = sc.amax(-1, keepdim=True)
+        mx = torch.where(torch.isfinite(mx), mx, torch.zeros_like(mx))   # fully-masked row
+        p = (sc - mx).exp()
+        den = p.sum(-1, keepdim=True)
+        if sink is not None:
+            den = den + (sink.view(1, -1, 1, 1).float() - mx).exp()
+        parts.append(((p / den) @ v.float()).to(q.dtype))
+    return torch.cat(parts, dim=2)
 
 
 def rope_cache(seq: int, dim: int, base: float, device, dtype=torch.float32):
@@ -1097,9 +1420,10 @@ class Attention(nn.Module):
         self.o_proj = L(self.nh * self.hd, cfg.d_model)
         self.q_norm = RMSNorm(self.hd, cfg.rms_eps) if cfg.qk_norm else nn.Identity()
         self.k_norm = RMSNorm(self.hd, cfg.rms_eps) if cfg.qk_norm else nn.Identity()
-        # Attention sink: a learnable key with a hard-zero value. It absorbs softmax mass that
-        # would otherwise be forced onto real tokens when the window slides past the prompt.
-        self.sink_k = nn.Parameter(torch.zeros(1, self.nkv, 1, self.hd, dtype=BF16)) \
+        # Attention sink: one learnable logit per query head, added to the softmax denominator
+        # with an implicit zero value. It absorbs the softmax mass that would otherwise be forced
+        # onto real tokens when the window slides past the prompt (StreamingLLM / GPT-OSS).
+        self.sink = nn.Parameter(torch.zeros(self.nh, dtype=torch.float32)) \
             if cfg.attn_sinks else None
 
     def forward(self, x, rope, masks, cache=None):
@@ -1119,29 +1443,28 @@ class Attention(nn.Module):
             if self.window and k.shape[2] > self.window:
                 k, v = k[:, :, -self.window:], v[:, :, -self.window:]
             new_cache = (k, v)
-        if self.sink_k is not None:
-            sk = self.sink_k.expand(B, -1, -1, -1).to(k.dtype)
-            k = torch.cat([sk, k], 2)
-            v = torch.cat([torch.zeros_like(sk), v], 2)      # zero value -> denominator only
         # The attention math itself stays BF16: arXiv:2509.25149 keeps attention out of FP4.
-        kw = {"enable_gqa": True} if self.nkv != self.nh else {}
         if cache is not None:
-            if L > 1:                      # prefill: build the mask explicitly. is_causal cannot be
-                                           # used because the sink column shifts the diagonal.
-                S = k.shape[2]
-                qi = torch.arange(S - L, S, device=x.device)[:, None]
-                ki = torch.arange(S, device=x.device)[None, :]
-                cm = ki <= qi
-                if self.window:
-                    cm &= (qi - ki) < self.window
-                if self.sink_k is not None:
-                    cm[:, 0] = True
-                out = F.scaled_dot_product_attention(q, k, v, attn_mask=cm[None, None], **kw)
-            else:
-                out = F.scaled_dot_product_attention(q, k, v, is_causal=False, **kw)
+            # Decode: the cache is already trimmed to the window, so the only mask left is
+            # causality between the queries in this call and the tail of the cache.
+            S = k.shape[2]
+            qi = torch.arange(S - L, S, device=x.device)[:, None]
+            ki = torch.arange(S, device=x.device)[None, :]
+            keep = ki <= qi
+            if self.window:
+                keep &= (qi - ki) < self.window
+            out = manual_attention(q, k, v, keep[None, None], self.sink)
+        elif USE_FLEX:
+            block_mask = masks[1 if self.is_global else 0]
+            out, lse = flex_attention(q, k, v, block_mask=block_mask,
+                                      enable_gqa=self.nkv != self.nh, return_lse=True)
+            if self.sink is not None:
+                # Folding the sink logit into the denominator after the fact: the fused kernel
+                # hands back the log-sum-exp it already computed, and
+                #   sum(exp(x)) / (sum(exp(x)) + exp(sink)) == sigmoid(lse - sink).
+                out = out * torch.sigmoid(lse - self.sink.view(1, -1, 1)).unsqueeze(-1).to(out.dtype)
         else:
-            mask = masks[1 if self.is_global else 0]
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, **kw)
+            out = manual_attention(q, k, v, masks[1 if self.is_global else 0], self.sink)
         out = out.transpose(1, 2).reshape(B, L, self.nh * self.hd)
         out = self.o_proj(out)
         return (out, new_cache) if cache is not None else out
@@ -1210,7 +1533,8 @@ class Block(nn.Module):
         self.mixer = self._make_mixer(idx)
         self.ffn = MoEFFN(idx) if cfg.moe else SwiGLU(idx)
         # tag the residual-output projections so _init can depth-scale their std
-        if isinstance(self.mixer, Attention):
+        # (fla's GatedDeltaNet also exposes `o_proj`, and it is a residual output too)
+        if hasattr(self.mixer, "o_proj"):
             self.mixer.o_proj._is_residual_out = True
         for m in self.ffn.modules():
             if isinstance(m, SwiGLU):
@@ -1219,11 +1543,15 @@ class Block(nn.Module):
     def _make_mixer(self, idx):
         if cfg.hybrid_linear and HAS_FLA and (idx + 1) % cfg.global_every != 0:
             from fla.layers import GatedDeltaNet          # linear-attention slot
+            # head_dim must be passed explicitly -- fla defaults to 256, which would silently
+            # build a 4096-wide key space on top of a 1024-wide model. layer_idx is what the
+            # fla cache keys recurrent state by, so decoding needs it.
             return GatedDeltaNet(hidden_size=cfg.d_model, num_heads=cfg.n_heads,
-                                 expand_v=1, use_gate=True).to(BF16)
+                                 head_dim=cfg.head_dim, expand_v=1, use_gate=True,
+                                 layer_idx=idx).to(BF16)
         return Attention(idx)
 
-    def forward(self, x, rope, masks, cache=None):
+    def forward(self, x, rope, masks, cache=None, fla_cache=None):
         h = self.pre_attn(x)
         new_cache = cache
         if isinstance(self.mixer, Attention):
@@ -1231,6 +1559,11 @@ class Block(nn.Module):
                 h, new_cache = self.mixer(h, rope, masks, cache)
             else:
                 h = self.mixer(h, rope, masks)
+        elif fla_cache is not None:
+            # Gated DeltaNet decodes recurrently. Its state lives in the fla Cache keyed by
+            # layer_idx; without threading it through, these layers would see only the single
+            # token of the current step and generation would ignore the entire prefix.
+            h = self.mixer(h, past_key_values=fla_cache, use_cache=True)[0]
         else:
             out = self.mixer(h)                      # gated DeltaNet returns (o, ...) in fla
             h = out[0] if isinstance(out, tuple) else out
@@ -1279,7 +1612,7 @@ class AletheiaChat(nn.Module):
         h = self.embed(idx)
         for b in self.blocks:
             if cfg.act_ckpt and self.training:
-                h = torch.utils.checkpoint.checkpoint(b, h, rope, masks, use_reentrant=False)
+                h = ACT_CKPT(b, h, rope, masks)
             else:
                 h = b(h, rope, masks)
         return (self.norm(h), h, rope, masks) if want_pre_norm else self.norm(h)
@@ -1298,13 +1631,16 @@ class AletheiaChat(nn.Module):
             ce = ce + cfg.z_loss * lse.pow(2).mean()
         return ce
 
-    def forward(self, idx, targets=None, loss_mask=None):
+    def forward(self, idx, targets=None, loss_mask=None, mtp: bool = True):
         if targets is None:
             return self.lm_head(self.hidden(idx)).float()
         h, pre, rope, masks = self.hidden(idx, want_pre_norm=True)
         loss = self._ce(h, targets, loss_mask)
         # --- multi-token prediction: head d predicts token t+1+d ------------
-        for d, (blk, nrm) in enumerate(zip(self.mtp, self.mtp_norm), start=1):
+        # `mtp=False` returns the bare next-token CE, which is what validation and any
+        # perplexity comparison need: the MTP term is a training auxiliary and adding it
+        # makes the number incomparable to a published loss or to a run with mtp_depth=0.
+        for d, (blk, nrm) in enumerate(zip(self.mtp if mtp else [], self.mtp_norm), start=1):
             if idx.shape[1] <= d:
                 break
             hp = blk(pre, rope, masks)
@@ -1317,6 +1653,11 @@ class AletheiaChat(nn.Module):
     def generate(self, idx, max_new_tokens=256, temperature=0.7, top_p=0.9,
                  rep_penalty=1.05, stop_ids=(EOS_ID,)):
         caches = [(None, None) for _ in self.blocks]
+        # One shared fla Cache for every gated-DeltaNet block; each keys its own slot by layer_idx.
+        fla_cache = None
+        if any(not isinstance(b.mixer, Attention) for b in self.blocks):
+            from fla.models.utils import Cache as FLACache
+            fla_cache = FLACache()
         rope = self.rope(idx.device)
         out = idx
         cur = idx
@@ -1324,7 +1665,7 @@ class AletheiaChat(nn.Module):
             h = self.embed(cur)
             new = []
             for b, c in zip(self.blocks, caches):
-                h, nc = b(h, rope, None, cache=c)
+                h, nc = b(h, rope, None, cache=c, fla_cache=fla_cache)
                 new.append(nc)
             caches = new
             logits = self.lm_head(self.norm(h))[:, -1].float()
@@ -1615,8 +1956,13 @@ class CheckpointManager:
 
     def save(self, step, telemetry):
         d = self.root / f"step_{step:07d}"; d.mkdir(parents=True, exist_ok=True)
+        # The FP32 masters are saved, not reconstructed. The model state_dict is BF16, so
+        # rebuilding masters from it on resume throws away exactly the low-order bits the
+        # master-weight design exists to keep -- a resume would silently undo the fix.
         torch.save({"model": model.state_dict(),
                     "muon": opt_muon.state_dict(), "adamw": opt_adamw.state_dict(),
+                    "masters": [[m.detach().cpu() for m in mw.master_params] for mw in MASTERS],
+                    "ema": {k: v.cpu() for k, v in ema.shadow.items()},
                     "step": step, "cfg": {k: str(v) for k, v in asdict(cfg).items()},
                     "rng": torch.get_rng_state()}, d / "state.pt")
         (d / "telemetry.json").write_text(json.dumps(telemetry))
@@ -1634,15 +1980,30 @@ class CheckpointManager:
         st = torch.load(Path(m["path"]) / "state.pt", map_location=DEV, weights_only=False)
         model.load_state_dict(st["model"])
         opt_muon.load_state_dict(st["muon"]); opt_adamw.load_state_dict(st["adamw"])
+        saved = st.get("masters")
+        if saved and cfg.fp32_master:
+            for mw, tensors in zip(MASTERS, saved):
+                for live, restored in zip(mw.master_params, tensors):
+                    live.data.copy_(restored.to(live.device))
+            self.masters_restored = True
+        for k, v in st.get("ema", {}).items():       # empty dict when ema_decay == 0
+            if k in ema.shadow:
+                ema.shadow[k].copy_(v.to(ema.shadow[k].device))
+        if "rng" in st:                              # resume the data/dropout stream too
+            torch.set_rng_state(st["rng"].cpu().to(torch.uint8))
         tel = json.loads((Path(m["path"]) / "telemetry.json").read_text())
         print(f"[ckpt] resumed at step {st['step']}")
         return st["step"], tel
 
 
 ckpt = CheckpointManager(CKPT)
+ckpt.masters_restored = False
 start_step, telemetry = ckpt.load()
-for _m in MASTERS:            # masters were cloned before the checkpoint was restored
-    _m.resync()
+if not ckpt.masters_restored:
+    # Fresh run, or a checkpoint written before masters were saved: seed the FP32 copies from
+    # whatever the model currently holds. Restored masters must NOT be overwritten this way.
+    for _m in MASTERS:
+        _m.resync()
 
 
 @torch.no_grad()
@@ -1655,7 +2016,7 @@ def evaluate(n_batches: int = 20) -> float:
         except StopIteration:
             break
         with quant_ctx(False, None):
-            tot += model(x.to(DEV), y.to(DEV)).item()
+            tot += model(x.to(DEV), y.to(DEV), mtp=False).item()
     model.train()
     return tot / max(1, i + 1)
 
@@ -2038,13 +2399,22 @@ def build_anneal(target_tokens: int):
     rows = synth_aletheia_qa() + pipeline_traces()
     try:
         from datasets import load_dataset
-        ds = load_dataset("HuggingFaceTB/smoltalk2", "SFT", split="train", streaming=True)
+        # `split="train"` does not exist on smoltalk2 -- see cell 4a. Interleave the SFT splits.
+        # The cap is also snapshotted before the loop: comparing against a list that the loop is
+        # itself growing can never terminate.
+        from datasets import interleave_datasets
+        want = len(rows)
+        ds = interleave_datasets(
+            [load_dataset("HuggingFaceTB/smoltalk2", "SFT", split=s, streaming=True)
+             for s in smoltalk_splits("SFT")],
+            stopping_strategy="all_exhausted",
+        )
         got = 0
         for row in ds:
             msgs = row.get("messages")
             if msgs:
                 rows.append({"messages": msgs}); got += 1
-            if got >= len(rows):
+            if got >= want:
                 break
         print(f"[+] smoltalk2: {got}")
     except Exception as exc:

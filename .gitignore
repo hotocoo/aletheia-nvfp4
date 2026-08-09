@@ -6,3 +6,7 @@ __pycache__/
 *.safetensors
 .ipynb_checkpoints/
 .venv/
+_smoke/
+_smoke_run*.ipynb
+run_*.ipynb
+logs/

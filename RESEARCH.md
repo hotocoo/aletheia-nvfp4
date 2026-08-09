@@ -240,7 +240,14 @@ The development machine is an **RTX 5070** — consumer Blackwell, `sm_120`, 12 
   over baseline; NVFP4 adds ~20% on some configurations and is *slower* than FP8 on others. Same
   thread: logit soft-capping costs ~15% throughput — a direct argument for QK-norm instead.
 - **Windows:** TE ships Linux wheels; use **WSL2**. The notebook therefore never assumes TE imports
-  successfully.
+  successfully. Run natively on Windows and `PRECISION_PATH` resolves to BF16 — the FP4 recipe, the
+  A/B table and the ablation grid all degrade to documented no-ops, so native Windows is the
+  *correctness* path and WSL2 is the *precision* path. A second native-Windows constraint is
+  `torch.compile`: inductor needs Triton, which has no Windows backend, and the failure surfaces
+  lazily inside the first forward pass rather than at the `torch.compile()` call — so `cfg.compile`
+  is forced off on Windows in the config cell instead of being caught in the training cell.
+  Verified natively on torch 2.7.1+cu128 / sm_120; the default PyPI `torch` wheel is CPU-only and
+  must be replaced with a cu128+ build.
 - **12 GB:** the `laptop` preset (1024×16, seq 1024) is a genuine run; the 13k-tok/param budget is
   not reachable there. This tension is stated in the notebook's first cell rather than hidden.
 
@@ -301,6 +308,16 @@ draft's 65,536 was wrong:
 
 For contrast Gemma 4 uses 262k — right for a 31B multilingual multimodal model, and ~17% of this
 model's parameters if copied blindly.
+
+**The id space is wider than the vocabulary.** Stage 2 can mint two superword merges whose
+byte-level strings coincide; the duplicates collapse in the vocabulary map, so `get_vocab_size()`
+returns fewer pieces than `max(id) + 1` — a handful of ids exist but are unused. Sizing the
+embedding by the *count* leaves the top ids unmapped, and the first id the tokenizer actually emits
+above that bound indexes past the embedding table. CUDA reports this as a device-side assert raised
+several kernels later inside the first backward pass (observed in an `RMSNorm` forward), which points
+nowhere near the cause. The notebook therefore sizes the embedding by the id space, rounded up to a
+multiple of 128 — which restores the 32768 alignment the vocabulary target asked for in the first
+place.
 
 The bottom 64 ids are reserved: chat surface (`<|system|>`, `<|user|>`, `<|assistant|>`, `<|think|>`,
 `<|tool_call|>`, `<|tool_result|>`, `<|eot|>`), Aletheia pipeline stages (`<|intent|>`, `<|context|>`,
@@ -466,27 +483,54 @@ Two further constraints that any 13k-tok/param plan has to satisfy and that are 
 
 - **Nemotron-CC / Nemotron-CC-v2** (arXiv:2412.02595): classifier ensembling + synthetic rephrasing +
   fewer heuristic filters. A high-quality subset improves **MMLU by +5.6 over DCLM** at 8B/1T; the
-  full 6.3T set matches DCLM on MMLU while holding **4× more unique real tokens**. Largest share.
+  full 6.3T set matches DCLM on MMLU while holding **4× more unique real tokens**. It is gated, so it
+  is the *first* candidate of the `web_hq` slot rather than its only one.
 - **FineWeb-Edu** and **DCLM**: both gain from aggressive model-based filtering but discard ~90% of
   data. Their union de-correlates filter bias — the **Zyda-2** construction (arXiv:2411.15242) is
-  5T tokens of FineWeb-Edu3 + DCLM + Zyda-1 + Dolma-CC with cross-deduplication.
+  5T tokens of FineWeb-Edu3 + DCLM + Zyda-1 + Dolma-CC with cross-deduplication. **Zyda-2 is the
+  ungated `web_hq` default**, which is a strict improvement on the previous design: that spent three
+  separate slots (`nemotron_cc_hq` / `fineweb_edu` / `dclm`) re-assembling this union by hand while
+  double-counting the overlap Zyda-2 already removes.
+- **Cosmopedia-v2** (`HuggingFaceTB/smollm-corpus`): 28B tokens of textbook-style synthetic rewrites,
+  the open instance of the synthetic-rephrasing axis Nemotron-CC-HQ's MMLU gain is credited to. Its
+  own `synthetic_edu` slot, because rephrased and crawled text are different distributions and the
+  mixture should be able to re-weight them independently.
+- **Dolmino-mix-1124**: OLMo 2's mid-training mix (quality-weighted web + reference + STEM) as the
+  `curated` slot.
 - **Ultra-FineWeb**: two-stage annealing as a cheap data-quality verifier — the pattern behind
   `cfg.mix` being a set of *fractions of budget* that can be re-weighted from a short anneal probe.
-- **Code and math**: the-stack-v2-dedup and open-web-math. The target model reads and writes Rust, C
-  and assembly about a kernel.
+- **Code**: `bigcode/starcoderdata` (all language configs interleaved) when the grant is held,
+  otherwise `OpenCoder-LLM/opc-annealing-corpus` across its three configs. The target model reads and
+  writes Rust, C and assembly about a kernel. **The Stack v2 is not usable as a text stream**: its
+  rows carry Software Heritage blob ids, and the contents require a separate S3 fetch with AWS
+  credentials — a `row["content"]` pipeline reads it as an unbounded run of empty rows rather than an
+  error. `starcoder2data-extras` is a different trap: its configs are arxiv / issues / wikipedia, so
+  it streams successfully while contributing no code.
+- **Math**: `HuggingFaceTB/finemath` `finemath-4plus`, the higher-precision successor to OpenWebMath
+  on the same crawl; OpenWebMath remains the fallback.
+- **Access and degradation**: the mixture is built entirely from **ungated** corpora. The gated sets
+  (Nemotron-CC-v2, starcoderdata) sit first in their chains so an account holding the grant uses them
+  automatically. Each slot is an ordered *candidate chain* — first source that authenticates and
+  actually yields text wins — and the shard builder closes with a realised-vs-requested mixture table
+  so neither a missing grant nor an exhausted stream can skew the blend behind a one-line warning.
+  Nothing is downloaded: every corpus is consumed with `streaming=True` and only `uint16` shards land
+  on disk.
 - **SmolLM3 / SmolTalk2** recipe: mid-training as a distinct phase — SmolLM3 used 35B tokens of
   OpenThoughts3-1.2M plus Llama-Nemotron-Post-Training v1.1 (R1 traces) for ~140B tokens over 4
   epochs, then SFT. SmolTalk2 is ~3.4M samples (OpenThoughts, Tulu 3, multilingual), split
-  Mid / SFT / Preference, decontaminated against benchmarks.
+  Mid / SFT / Preference, decontaminated against benchmarks. The `SFT` config has **no `train`
+  split** — it is 25 named sub-corpora, and interleaving all of them is the recipe; requesting
+  `train` raises, which would silently zero the chat share of the mixture.
 - **Aletheia OS repo**: upsampled `aletheia_epochs` times, plus two mechanically generated sets —
   heading-anchored doc QA and Rust-item QA (each answer quotes real file content and cites the path),
   and templated `intent → context → plan → capability → policy → action → provenance` traces so the
   OS's control flow is learned as a conversational form. No teacher model is involved, so the facts
   are the repository's facts.
 
-**Mapped to:** `cfg.mix = {nemotron_cc_hq .34, fineweb_edu .20, dclm .10, code .18, math .06,
-aletheia .08, chat .04}`, streaming ingestion, and a masked anneal phase (loss on assistant spans
-only) co-located with the BF16 tail.
+**Mapped to:** `cfg.mix = {web_hq .34, synthetic_edu .18, curated .10, chat .14, code .11, math .05,
+aletheia .08}` — slot names are mixture *roles*, each resolved through a candidate chain — plus
+streaming ingestion and a masked anneal phase (loss on assistant spans only) co-located with the
+BF16 tail.
 
 ---
 
