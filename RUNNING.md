@@ -124,18 +124,35 @@ raise `grad_accum` to 16: identical tokens per step, half the activation memory.
 ## 3. Start the run
 
 ```powershell
-wsl -d Ubuntu -u root -- bash $REPO/tools/wsl_pretrain.sh
+wsl -d Ubuntu -u root -- bash $REPO/tools/wsl_pretrain_bg.sh
 ```
 
 What it does: copies the notebook to `/root/aletheia-run` (ext4 — shard reads over `/mnt/c` go
 through the 9p bridge and cost more than the GPU does), picks up your Hugging Face token from the
-Windows-side cache if WSL has none, and runs the whole notebook under papermill with live output.
+Windows-side cache if WSL has none, and runs the whole notebook under papermill — as a systemd
+transient unit named `aletheia-pretrain`, so the run belongs to PID 1 inside the VM rather than to
+the console you started it from.
 
-To keep it running while you use the machine for other things, launch it detached:
+**Launch it this way and not any other way.** Two launch styles look like they should work and
+both lose the run:
+
+- `Start-Process powershell ... -WindowStyle Hidden` ties the run's lifetime to a `wsl.exe` session
+  on the Windows side. The WSL service can get into a state where it answers
+  `Wsl/Service/E_UNEXPECTED` for every new session while the distro itself is still up; the hidden
+  launcher dies with it and papermill goes down mid-stage.
+- `setsid nohup ... &` inside a `wsl -- ...` invocation does not survive either. WSL reaps the
+  process tree of a non-interactive session when it exits, so the child is gone seconds after the
+  command returns.
+
+`wsl_pretrain_bg.sh` handles both: it refuses to start a second copy, and falls back to `setsid`
+only on a distro without systemd. `wsl_pretrain.sh` still runs the notebook in the foreground if
+you want to watch it directly in one console.
+
+Once it is up:
 
 ```powershell
-Start-Process powershell -ArgumentList '-NoProfile','-Command',
-  "wsl -d Ubuntu -u root -- bash $REPO/tools/wsl_pretrain.sh" -WindowStyle Hidden
+wsl -d Ubuntu -u root -- systemctl is-active aletheia-pretrain   # -> active
+wsl -d Ubuntu -u root -- systemctl stop aletheia-pretrain        # stop it
 ```
 
 **The first training step takes several minutes with no output.** FlexAttention compiles its
@@ -176,8 +193,13 @@ while ($true) { cls; wsl -d Ubuntu -u root -- $PY $REPO/tools/train_status.py /r
 ### Verbose — the raw log
 
 ```powershell
-wsl -d Ubuntu -u root -- tail -f /root/aletheia-run/logs/pretrain.log
+Get-Content '\\wsl.localhost\Ubuntu\root\aletheia-run\logs\pretrain.log' -Wait -Tail 40
 ```
+
+Read the file over the `\\wsl.localhost` share rather than `wsl -- tail -f`. A `tail -f` holds a
+WSL session relay open for as long as you watch, and a relay held open for days is the most likely
+way to put the WSL service into the `E_UNEXPECTED` state described in §3. `Get-Content -Wait`
+holds no session at all.
 
 Everything papermill sees: per-cell markers, the shard builder's source resolution, the tqdm bar
 with live `loss / ppl / lr / gnorm / tok_s / prec`. `prec` flips from `q` to `bf16` at 82% of
@@ -186,7 +208,7 @@ tokens — that switch is intentional, it's the recipe's BF16 tail.
 Last 100 lines instead of following:
 
 ```powershell
-wsl -d Ubuntu -u root -- tail -100 /root/aletheia-run/logs/pretrain.log
+Get-Content '\\wsl.localhost\Ubuntu\root\aletheia-run\logs\pretrain.log' -Tail 100
 ```
 
 ### GPU
@@ -284,4 +306,6 @@ Knobs worth knowing, all in the config cell:
 | OOM | activation memory | `micro_batch=1`, `grad_accum=16` |
 | GPU utilization near zero | data loader starving | check the log for shard-building or HF download retries |
 | Whole machine freezes | WSL2 uncapped, or two heavy jobs at once | check `.wslconfig`; never build and train simultaneously |
-| Checkpoint stale >1 h | run died | `tail` the log for the traceback, then relaunch — it resumes |
+| Checkpoint stale >1 h | run died | read the log for the traceback, then relaunch — it resumes |
+| `Wsl/Service/E_UNEXPECTED` on every `wsl` command, distro still listed as running | WSL session state corrupted — often a `tail -f` relay held open for a long time | the VM recycles on its own; wait, then relaunch with `wsl_pretrain_bg.sh` and watch via `\\wsl.localhost` instead |
+| Run vanishes shortly after launch, empty launcher log | backgrounded inside a `wsl -- ...` session, which WSL reaps on exit | launch with `wsl_pretrain_bg.sh` (systemd unit), not `setsid`/`Start-Process` |
