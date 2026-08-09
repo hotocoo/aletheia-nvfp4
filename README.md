@@ -199,7 +199,3 @@ calling it SOTA.
 - No distillation. Strongest quality lever at this scale, out of scope for a from-scratch pretrain.
 
 Full risk list: [`RESEARCH.md §10`](RESEARCH.md#10-open-risks).
-
-## License
-
-MIT.
